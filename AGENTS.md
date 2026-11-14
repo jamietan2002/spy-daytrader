@@ -33,3 +33,4 @@ Always run:
 ```bash
 .venv/bin/pytest -v -W error --cov=spy_daytrader --cov-report=term-missing
 ```
+

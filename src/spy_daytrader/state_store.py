@@ -234,3 +234,4 @@ class SQLiteStateLedger:
         finally:
             if self._memory_conn is None:
                 conn.close()
+

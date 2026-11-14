@@ -69,3 +69,4 @@ cp .env.example .env
 ```bash
 .venv/bin/pytest -v -W error --cov=spy_daytrader --cov-report=term-missing
 ```
+
