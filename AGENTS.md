@@ -1,0 +1,35 @@
+# AGENTS.md — SPY Intraday Day-Trading Bot Engineering Rules
+
+## 1. Non-Negotiable Safety & Quantitative Invariants
+
+1. **Paper Trading Lock (`ALPACA_PAPER=true`)**:
+   - `src/spy_daytrader/config.py` enforces `alpaca_paper=True` and `https://paper-api.alpaca.markets`. Any non-paper setting raises `LiveTradingProhibitedError`. Never weaken or bypass this check.
+2. **Zero Secret Leakage**:
+   - Never log or commit credentials. All loggers must route through `get_logger()` in `src/spy_daytrader/logging_utils.py` (`SecretScrubbingFilter`).
+3. **Closed-Bar Causality & Indicator Convergence**:
+   - Never evaluate signals on incomplete/forming 5m candles (`bar_open + 5m <= now_et`).
+   - Always fetch `>= 250` (default `650`) RTH 5-minute bars so `EMA(200)` is non-NaN and converged.
+4. **Bot-Scoped OMS Isolation (`spydt-*` + `SQLiteStateLedger`)**:
+   - Every order must carry a deterministic `spydt-*` `client_order_id` and be recorded in `data/bot_state.db`.
+   - EOD flatten (`15:55 ET`) must cancel child bracket orders before calling `close_position` and must never liquidate external positions not originated by `spydt-*` unless `--force-unowned` is explicitly invoked by the operator.
+
+## 2. Module Map
+
+| File | Responsibility |
+|---|---|
+| `main.py` / `src/spy_daytrader/cli.py` | CLI (`run`, `once`, `status`, `flatten`, `backtest`) |
+| `src/spy_daytrader/config.py` | Frozen Pydantic config, `StrategyMode`, `ATRProfile`, Paper-mode lock |
+| `src/spy_daytrader/data_feed.py` | Alpaca 5m RTH closed-bar feed (`IEX`/`SIP` auto-fallback) & live NBBO quote anchor |
+| `src/spy_daytrader/indicators.py` | `pandas-ta` `EMA(200)`, `EMA(50)`, `StochRSI(14,14,3,3)`, `ATR(14)`, daily `Session VWAP` |
+| `src/spy_daytrader/strategy.py` | `BASELINE` & `ALPHA_MAX` v2 session-regime signal engine |
+| `src/spy_daytrader/risk.py` | `1%` equity risk sizing, buying-power cap, Marketable Limit collar, circuit breakers |
+| `src/spy_daytrader/state_store.py` | WAL-mode SQLite persistence (`processed_bars`, `bot_orders`, bot daily P&L) |
+| `src/spy_daytrader/broker.py` | Alpaca `TradingClient` adapter, stale limit auto-cancel, isolated EOD flatten |
+| `src/spy_daytrader/engine.py` | Boundary-snapped (`:00:01.5s`) 1m execution loop & graceful signal handling |
+| `src/spy_daytrader/backtest.py` | Event-driven 5m chronological backtester with limit-collar & slippage physics |
+
+## 3. Mandatory Verification Before Committing
+Always run:
+```bash
+.venv/bin/pytest -v -W error --cov=spy_daytrader --cov-report=term-missing
+```
