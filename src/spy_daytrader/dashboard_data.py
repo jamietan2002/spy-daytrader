@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, time, timedelta, timezone
+import json
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -303,10 +304,23 @@ def fetch_dashboard_snapshot(
     and assemble a complete, plain-English `DashboardSnapshot`.
     """
     state_ledger = ledger or SQLiteStateLedger(config.state_db_path)
+
+    # Extract skipped checks from SQLite first (shared by both live API & GitHub-synced DB modes)
+    skipped_by_day = _extract_skipped_by_day(state_ledger, default_symbol=config.symbol)
+
+    has_live_creds = trading_client is not None or (
+        bool(config.alpaca_api_key.strip()) and bool(config.alpaca_secret_key.strip())
+    )
+    if not has_live_creds:
+        return _load_or_build_offline_snapshot(
+            config=config,
+            state_ledger=state_ledger,
+            skipped_by_day=skipped_by_day,
+        )
+
     if trading_client is not None:
         client = trading_client
     else:
-        config.require_credentials()
         client = TradingClient(
             api_key=config.alpaca_api_key,
             secret_key=config.alpaca_secret_key,
@@ -371,34 +385,7 @@ def fetch_dashboard_snapshot(
     for d_key in orders_by_day:
         orders_by_day[d_key].sort(key=lambda r: r.timestamp_utc, reverse=True)
 
-    # 3. Skipped checks from SQLite (deduplicated per day + plain-English reason)
-    skipped_by_day: dict[date, list[SkippedCheckRow]] = {}
-    seen_skip_keys: set[tuple[date, str, str]] = set()
-    for rec in state_ledger.list_recent_processed_bars(limit=150):
-        act = str(rec.get("action", "")).upper()
-        rsn = str(rec.get("reason", ""))
-        if act != "NONE" and not rsn.startswith("RISK_VETO"):
-            continue
-        ts_raw = rec.get("created_at_utc", "")
-        try:
-            dt_utc = datetime.fromisoformat(ts_raw)
-        except ValueError:
-            continue
-        sess_d = dt_utc.astimezone(NY_TZ).date()
-        sym = str(rec.get("symbol", config.symbol)).upper()
-        plain_r = translate_skip_reason(rsn)
-        dedup_key = (sess_d, sym, plain_r)
-        if dedup_key in seen_skip_keys:
-            continue
-        seen_skip_keys.add(dedup_key)
-        skipped_by_day.setdefault(sess_d, []).append(
-            SkippedCheckRow(
-                timestamp_sgt_label=format_sgt(dt_utc),
-                session_date=sess_d,
-                symbol=sym,
-                plain_reason=plain_r,
-            )
-        )
+    # 3. Skipped checks from SQLite (already extracted above)
 
     # 4. Daily P&L Table (merging Alpaca PortfolioHistory with closed round-trip counts)
     daily_pnl_rows = _build_daily_pnl_rows(
@@ -420,7 +407,7 @@ def fetch_dashboard_snapshot(
     all_day_keys = set(orders_by_day.keys()) | {r.session_date for r in daily_pnl_rows} | {today_ny}
     available_days = sorted(all_day_keys, reverse=True)
 
-    return DashboardSnapshot(
+    snap = DashboardSnapshot(
         symbol=config.symbol,
         equity_usd=round(equity, 2),
         cash_usd=round(cash, 2),
@@ -439,6 +426,11 @@ def fetch_dashboard_snapshot(
         daily_pnl_rows=daily_pnl_rows,
         available_days=available_days,
     )
+    state_ledger.save_dashboard_cache(
+        _serialize_snapshot(snap, next_open_utc=next_open_utc),
+        updated_at_utc=now_utc,
+    )
+    return snap
 
 
 def _extract_open_trade_view(
@@ -902,4 +894,246 @@ def _build_daily_pnl_rows(
             )
         )
     return rows
+
+
+def _extract_skipped_by_day(
+    state_ledger: SQLiteStateLedger,
+    *,
+    default_symbol: str,
+) -> dict[date, list[SkippedCheckRow]]:
+    skipped_by_day: dict[date, list[SkippedCheckRow]] = {}
+    seen_skip_keys: set[tuple[date, str, str]] = set()
+    for rec in state_ledger.list_recent_processed_bars(limit=150):
+        act = str(rec.get("action", "")).upper()
+        rsn = str(rec.get("reason", ""))
+        if act != "NONE" and not rsn.startswith("RISK_VETO"):
+            continue
+        ts_raw = rec.get("created_at_utc", "")
+        try:
+            dt_utc = datetime.fromisoformat(ts_raw)
+        except ValueError:
+            continue
+        sess_d = dt_utc.astimezone(NY_TZ).date()
+        sym = str(rec.get("symbol", default_symbol)).upper()
+        plain_r = translate_skip_reason(rsn)
+        dedup_key = (sess_d, sym, plain_r)
+        if dedup_key in seen_skip_keys:
+            continue
+        seen_skip_keys.add(dedup_key)
+        skipped_by_day.setdefault(sess_d, []).append(
+            SkippedCheckRow(
+                timestamp_sgt_label=format_sgt(dt_utc),
+                session_date=sess_d,
+                symbol=sym,
+                plain_reason=plain_r,
+            )
+        )
+    return skipped_by_day
+
+
+def _estimate_nyse_clock(
+    now_utc: datetime,
+    hb: BotHeartbeat | None,
+) -> tuple[bool, datetime]:
+    """Estimate current NYSE open status and next opening bell when running from synced DB."""
+    if hb is not None and hb.next_open_utc is not None:
+        hb_next = (
+            hb.next_open_utc
+            if hb.next_open_utc.tzinfo is not None
+            else hb.next_open_utc.replace(tzinfo=timezone.utc)
+        )
+        if hb_next > now_utc:
+            now_et = now_utc.astimezone(NY_TZ)
+            is_open_now = (
+                now_et.weekday() < 5
+                and time(9, 30) <= now_et.time() < time(16, 0)
+                and hb_next.astimezone(NY_TZ).date() > now_et.date()
+            )
+            return is_open_now, hb_next
+
+    now_et = now_utc.astimezone(NY_TZ)
+    is_open = now_et.weekday() < 5 and time(9, 30) <= now_et.time() < time(16, 0)
+
+    cand_date = now_et.date()
+    if now_et.weekday() < 5 and now_et.time() < time(9, 30):
+        next_date = cand_date
+    else:
+        next_date = cand_date + timedelta(days=1)
+    while next_date.weekday() >= 5:
+        next_date += timedelta(days=1)
+    next_open_et = datetime(next_date.year, next_date.month, next_date.day, 9, 30, tzinfo=NY_TZ)
+    return is_open, next_open_et.astimezone(timezone.utc)
+
+
+def _serialize_snapshot(
+    snap: DashboardSnapshot,
+    *,
+    next_open_utc: datetime | None,
+) -> str:
+    flat_orders: list[dict[str, Any]] = []
+    for day_list in snap.orders_by_day.values():
+        for r in day_list:
+            flat_orders.append(
+                {
+                    "timestamp_utc": r.timestamp_utc.isoformat(),
+                    "timestamp_sgt_label": r.timestamp_sgt_label,
+                    "session_date": r.session_date.isoformat(),
+                    "symbol": r.symbol,
+                    "action_label": r.action_label,
+                    "shares": r.shares,
+                    "price_label": r.price_label,
+                    "status_label": r.status_label,
+                    "realized_pnl_usd": r.realized_pnl_usd,
+                    "plain_summary": r.plain_summary,
+                    "is_bot_order": r.is_bot_order,
+                }
+            )
+    pnl_rows_json = [
+        {
+            "session_date": r.session_date.isoformat(),
+            "date_label": r.date_label,
+            "trades_closed": r.trades_closed,
+            "wins": r.wins,
+            "losses": r.losses,
+            "day_pnl_usd": r.day_pnl_usd,
+            "day_return_pct": r.day_return_pct,
+            "ending_equity_usd": r.ending_equity_usd,
+        }
+        for r in snap.daily_pnl_rows
+    ]
+    payload = {
+        "symbol": snap.symbol,
+        "equity_usd": snap.equity_usd,
+        "cash_usd": snap.cash_usd,
+        "buying_power_usd": snap.buying_power_usd,
+        "today_pnl_usd": snap.today_pnl_usd,
+        "today_pnl_pct": snap.today_pnl_pct,
+        "closed_trades_30d": snap.closed_trades_30d,
+        "win_rate_30d_pct": snap.win_rate_30d_pct,
+        "net_pnl_30d_usd": snap.net_pnl_30d_usd,
+        "next_open_utc": next_open_utc.isoformat() if next_open_utc is not None else None,
+        "open_trade": asdict(snap.open_trade) if snap.open_trade is not None else None,
+        "working_entry": asdict(snap.working_entry) if snap.working_entry is not None else None,
+        "orders": flat_orders,
+        "daily_pnl_rows": pnl_rows_json,
+    }
+    return json.dumps(payload)
+
+
+def _load_or_build_offline_snapshot(
+    *,
+    config: BotConfig,
+    state_ledger: SQLiteStateLedger,
+    skipped_by_day: dict[date, list[SkippedCheckRow]],
+) -> DashboardSnapshot:
+    """
+    Serve the dashboard seamlessly on Streamlit Community Cloud using only the GitHub-synced
+    `data/bot_state.db` ledger when Alpaca API keys are stored solely in GitHub Secrets.
+    """
+    now_utc = datetime.now(timezone.utc)
+    today_ny = now_utc.astimezone(NY_TZ).date()
+    hb = state_ledger.get_latest_heartbeat()
+    is_open, next_open_utc = _estimate_nyse_clock(now_utc, hb)
+    header_line = build_header_status(
+        market_open=is_open,
+        next_open_utc=next_open_utc,
+        heartbeat=hb,
+        reference_utc=now_utc,
+    )
+
+    cached = state_ledger.load_dashboard_cache()
+    if cached is not None:
+        raw_json, _updated_at = cached
+        data = json.loads(raw_json)
+        open_trade = (
+            OpenTradeView(**data["open_trade"]) if data.get("open_trade") is not None else None
+        )
+        working_entry = (
+            WorkingEntryView(**data["working_entry"])
+            if data.get("working_entry") is not None
+            else None
+        )
+        orders_by_day: dict[date, list[OrderJournalRow]] = {}
+        for item in data.get("orders", []):
+            sd = date.fromisoformat(item["session_date"])
+            row = OrderJournalRow(
+                timestamp_utc=datetime.fromisoformat(item["timestamp_utc"]),
+                timestamp_sgt_label=item["timestamp_sgt_label"],
+                session_date=sd,
+                symbol=item["symbol"],
+                action_label=item["action_label"],
+                shares=int(item["shares"]),
+                price_label=item["price_label"],
+                status_label=item["status_label"],
+                realized_pnl_usd=item.get("realized_pnl_usd"),
+                plain_summary=item["plain_summary"],
+                is_bot_order=bool(item.get("is_bot_order", True)),
+            )
+            orders_by_day.setdefault(sd, []).append(row)
+        for d_key in orders_by_day:
+            orders_by_day[d_key].sort(key=lambda r: r.timestamp_utc, reverse=True)
+
+        daily_pnl_rows = [
+            DailyPnLRow(
+                session_date=date.fromisoformat(r["session_date"]),
+                date_label=r["date_label"],
+                trades_closed=int(r["trades_closed"]),
+                wins=int(r["wins"]),
+                losses=int(r["losses"]),
+                day_pnl_usd=float(r["day_pnl_usd"]),
+                day_return_pct=float(r["day_return_pct"]),
+                ending_equity_usd=float(r["ending_equity_usd"]),
+            )
+            for r in data.get("daily_pnl_rows", [])
+        ]
+        all_days = set(orders_by_day.keys()) | {r.session_date for r in daily_pnl_rows} | {today_ny}
+        return DashboardSnapshot(
+            symbol=str(data.get("symbol", config.symbol)),
+            equity_usd=float(data.get("equity_usd", 100_000.0)),
+            cash_usd=float(data.get("cash_usd", 100_000.0)),
+            buying_power_usd=float(data.get("buying_power_usd", 400_000.0)),
+            today_pnl_usd=float(data.get("today_pnl_usd", 0.0)),
+            today_pnl_pct=float(data.get("today_pnl_pct", 0.0)),
+            market_open=is_open,
+            header_status_line=header_line,
+            closed_trades_30d=int(data.get("closed_trades_30d", 0)),
+            win_rate_30d_pct=data.get("win_rate_30d_pct"),
+            net_pnl_30d_usd=float(data.get("net_pnl_30d_usd", 0.0)),
+            open_trade=open_trade,
+            working_entry=working_entry,
+            orders_by_day=orders_by_day,
+            skipped_by_day=skipped_by_day,
+            daily_pnl_rows=daily_pnl_rows,
+            available_days=sorted(all_days, reverse=True),
+        )
+
+    fallback_row = DailyPnLRow(
+        session_date=today_ny,
+        date_label=today_ny.strftime("%a, %b %d, %Y"),
+        trades_closed=0,
+        wins=0,
+        losses=0,
+        day_pnl_usd=0.0,
+        day_return_pct=0.0,
+        ending_equity_usd=100_000.0,
+    )
+    return DashboardSnapshot(
+        symbol=config.symbol,
+        equity_usd=100_000.0,
+        cash_usd=100_000.0,
+        buying_power_usd=400_000.0,
+        today_pnl_usd=0.0,
+        today_pnl_pct=0.0,
+        market_open=is_open,
+        header_status_line=header_line,
+        closed_trades_30d=0,
+        win_rate_30d_pct=None,
+        net_pnl_30d_usd=0.0,
+        open_trade=None,
+        working_entry=None,
+        orders_by_day={},
+        skipped_by_day=skipped_by_day,
+        daily_pnl_rows=[fallback_row],
+        available_days=[today_ny],
+    )
 

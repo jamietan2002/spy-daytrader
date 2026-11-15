@@ -11,24 +11,16 @@
 
 ---
 
-## One-Time Streamlit Community Cloud UI Setup (~1 Minute, Free Forever)
+## One-Time Streamlit Community Cloud UI Setup (~30 Seconds, Zero Extra Secrets Required)
 
-*(Note: `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` for Paper Account #3 are already configured in your GitHub Actions Secrets on `jamietan2002/spy-daytrader`.)*
+Because **GitHub Actions** (which already holds your `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in GitHub Secrets) syncs the non-secret portfolio, open-trade, order-journal, and daily-P&L snapshot directly into `data/bot_state.db` on `main` (on every trade event, every 15 minutes during market hours, and at session close — identical to `jamietan2002/trader`), **Streamlit Community Cloud works out-of-the-box with zero Streamlit Secrets needed**:
 
 1. Go to [https://share.streamlit.io](https://share.streamlit.io) and click **Create app**:
    - **Repository**: `jamietan2002/spy-daytrader`
    - **Branch**: `main`
    - **Main file path**: `dashboard/streamlit_app.py`
-2. Click **Advanced settings... -> Secrets** and paste your dedicated Paper Account #3 credentials in TOML format:
-   ```toml
-   ALPACA_API_KEY = "<your_paper_account_3_key>"
-   ALPACA_SECRET_KEY = "<your_paper_account_3_secret>"
-   ALPACA_DATA_FEED = "iex"
-   STRATEGY_MODE = "alpha_max"
-   ATR_PROFILE = "standard"
-   TRADING_SYMBOL = "SPY"
-   ```
-3. Click **Deploy!** — you now have a permanent, free-forever HTTPS dashboard showing live trades and daily P&L in Singapore Time (`SGT`).
+2. Click **Deploy!** — your dashboard immediately reads the synced `data/bot_state.db` ledger with zero setup.
+3. *(Optional)* If you ever want direct `30-second` live broker polling without waiting for GitHub Actions commits, you can also paste `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` into Streamlit Cloud's **App Settings -> Secrets**.
 
 ---
 

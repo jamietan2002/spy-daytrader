@@ -48,6 +48,12 @@ CREATE TABLE IF NOT EXISTS bot_heartbeat (
     next_open_utc TEXT NOT NULL,
     updated_at_utc TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS dashboard_cache (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    payload_json TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
 """
 
 
@@ -97,15 +103,21 @@ class SQLiteStateLedger:
             self._memory_conn.row_factory = sqlite3.Row
             self._memory_conn.executescript(_SCHEMA_SQL)
         else:
-            with self._connect() as conn:
-                conn.executescript(_SCHEMA_SQL)
+            try:
+                with self._connect() as conn:
+                    conn.executescript(_SCHEMA_SQL)
+            except sqlite3.OperationalError:
+                pass
 
     def _connect(self) -> sqlite3.Connection:
         if self._memory_conn is not None:
             return self._memory_conn
         conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+        except sqlite3.OperationalError:
+            pass
         return conn
 
     def record_heartbeat(
@@ -360,6 +372,48 @@ class SQLiteStateLedger:
                 (session_date.isoformat(),),
             ).fetchone()
             return float(row["pnl"]) if row is not None else 0.0
+        finally:
+            if self._memory_conn is None:
+                conn.close()
+
+    def save_dashboard_cache(
+        self,
+        payload_json: str,
+        *,
+        updated_at_utc: datetime | None = None,
+    ) -> None:
+        """Persist non-secret UI snapshot JSON so Streamlit Cloud works from GitHub Secrets alone."""
+        now_iso = (updated_at_utc or datetime.now(timezone.utc)).isoformat()
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO dashboard_cache (singleton_id, payload_json, updated_at_utc)
+                    VALUES (1, ?, ?)
+                    """,
+                    (payload_json, now_iso),
+                )
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            if self._memory_conn is None:
+                conn.close()
+
+    def load_dashboard_cache(self) -> tuple[str, datetime] | None:
+        """Load persisted UI snapshot JSON written by GitHub Actions or local bot."""
+        if str(self.db_path) != ":memory:" and not self.db_path.exists():
+            return None
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT payload_json, updated_at_utc FROM dashboard_cache WHERE singleton_id = 1"
+            ).fetchone()
+            if row is None:
+                return None
+            return str(row["payload_json"]), datetime.fromisoformat(str(row["updated_at_utc"]))
+        except sqlite3.OperationalError:
+            return None
         finally:
             if self._memory_conn is None:
                 conn.close()

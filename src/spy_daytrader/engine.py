@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import signal
+import sqlite3
+import subprocess
 import time as time_mod
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
@@ -10,6 +13,7 @@ from typing import Callable
 
 from spy_daytrader.broker import AlpacaPaperBroker, OrderSubmissionReceipt
 from spy_daytrader.config import BotConfig
+from spy_daytrader.dashboard_data import fetch_dashboard_snapshot
 from spy_daytrader.data_feed import NY_TZ, MarketDataFeed
 from spy_daytrader.indicators import compute_indicators
 from spy_daytrader.logging_utils import get_logger
@@ -78,6 +82,39 @@ class IntradayTradingBot:
             next_open_utc=next_open_utc,
             updated_at_utc=now_utc,
         )
+
+    def _sync_cloud_state(self, *, push_git: bool = False) -> None:
+        """Refresh `dashboard_cache` in SQLite (and push `[skip ci]` inside GitHub Actions on trade events)."""
+        try:
+            if self.config.alpaca_api_key.strip() and self.config.alpaca_secret_key.strip():
+                fetch_dashboard_snapshot(self.config, ledger=self.ledger)
+        except Exception as exc:
+            self.logger.debug("Non-fatal dashboard cache refresh skipped: %s", exc)
+
+        if not push_git or os.getenv("GITHUB_ACTIONS") != "true":
+            return
+        try:
+            db_path = self.ledger.db_path
+            if str(db_path) != ":memory:" and db_path.exists():
+                conn = sqlite3.connect(str(db_path))
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                conn.close()
+                subprocess.run(["git", "config", "user.name", "spy-daytrader-bot"], check=False)
+                subprocess.run(
+                    ["git", "config", "user.email", "actions@users.noreply.github.com"],
+                    check=False,
+                )
+                subprocess.run(["git", "add", str(db_path)], check=False)
+                diff_rc = subprocess.run(["git", "diff", "--staged", "--quiet"], check=False).returncode
+                if diff_rc != 0:
+                    subprocess.run(
+                        ["git", "commit", "-m", "chore(state): live intraday trade state sync [skip ci]"],
+                        check=False,
+                    )
+                    subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
+                    subprocess.run(["git", "push", "origin", "HEAD:main"], check=False)
+        except Exception as exc:
+            self.logger.warning("Non-fatal live git state sync skipped: %s", exc)
 
     def run_once(self, *, dry_run: bool = False) -> CycleOutcome:
         """Execute a single 1-minute supervision & signal evaluation cycle."""
@@ -486,6 +523,11 @@ class IntradayTradingBot:
                 outcome = self.run_once(dry_run=dry_run)
                 if outcome.market_open:
                     saw_market_open = True
+                if outcome is not None and (
+                    outcome.status in {"ORDER_SUBMITTED", "EOD_FLATTENED"}
+                    or (outcome.market_open and cycles > 0 and cycles % 15 == 0)
+                ):
+                    self._sync_cloud_state(push_git=True)
             except Exception as exc:
                 self.logger.exception("Unhandled error in session cycle (recovering): %s", exc)
 
@@ -520,5 +562,6 @@ class IntradayTradingBot:
                 time_mod.sleep(step)
                 slept += step
 
+        self._sync_cloud_state(push_git=False)
         self.logger.info("Session runner finished cleanly after %d cycle(s).", cycles)
         return 0

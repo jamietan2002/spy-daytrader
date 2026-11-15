@@ -243,6 +243,19 @@ def test_dashboard_snapshot_reconciles_open_trade_and_closed_roundtrip_pnl(tmp_p
     )
     assert "+$520.00" in takeaway
 
+    # Verify GitHub-Secrets-Only mode: when Streamlit Cloud has NO local keys, it serves persisted dashboard_cache seamlessly!
+    offline_cfg = BotConfig(
+        alpaca_api_key="",
+        alpaca_secret_key="",
+        state_db_path=str(tmp_path / "ui_state.db"),
+    )
+    offline_snap = fetch_dashboard_snapshot(offline_cfg, ledger=ledger)
+    assert offline_snap.equity_usd == 100520.00
+    assert offline_snap.today_pnl_usd == 520.00
+    assert offline_snap.open_trade is not None
+    assert offline_snap.open_trade.shares == 200
+    assert offline_snap.net_pnl_30d_usd == 300.00
+
 
 def test_streamlit_app_renders_headlessly_without_exceptions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("ALPACA_API_KEY", "")
@@ -252,4 +265,8 @@ def test_streamlit_app_renders_headlessly_without_exceptions(monkeypatch: pytest
     at = AppTest.from_file(str(REPO_ROOT / "dashboard" / "streamlit_app.py"))
     at.run(timeout=10)
     assert not at.exception
+    rendered_html = " ".join(m.value for m in at.markdown)
+    assert "Missing ALPACA_API_KEY" not in rendered_html
+    assert "Connection Configuration Needed" not in rendered_html
+    assert "$100,000.00" in rendered_html
 

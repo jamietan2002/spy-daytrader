@@ -91,8 +91,17 @@ jobs:
         if: always()
         run: |
           python - << 'EOF'
-          import sqlite3
+          import sqlite3, sys
           from pathlib import Path
+          sys.path.insert(0, "src")
+          from spy_daytrader.config import BotConfig
+          from spy_daytrader.dashboard_data import fetch_dashboard_snapshot
+          try:
+              cfg = BotConfig.from_env()
+              if cfg.alpaca_api_key.strip() and cfg.alpaca_secret_key.strip():
+                  fetch_dashboard_snapshot(cfg)
+          except Exception as exc:
+              print("Dashboard snapshot cache warning:", exc)
           db = Path("data/bot_state.db")
           if db.exists():
               conn = sqlite3.connect(str(db))
