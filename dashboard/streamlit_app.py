@@ -11,6 +11,7 @@ Linear / Apple Stocks Aesthetic:
 from __future__ import annotations
 
 import html
+import importlib
 import os
 import sys
 from datetime import date
@@ -23,17 +24,35 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from spy_daytrader.config import BotConfig  # noqa: E402
-from spy_daytrader.dashboard_data import (  # noqa: E402
-    DailyPnLRow,
-    DashboardSnapshot,
-    OpenTradeView,
-    OrderJournalRow,
-    WorkingEntryView,
-    build_daily_takeaway,
-    fetch_dashboard_snapshot,
-    format_eod_close_sgt,
+import spy_daytrader.config as _cfg_mod  # noqa: E402
+import spy_daytrader.state_store as _store_mod  # noqa: E402
+import spy_daytrader.dashboard_data as _data_mod  # noqa: E402
+
+# Hot-reload submodules in long-lived Streamlit Cloud processes whenever Git pulls updates to `src/`
+_MODULE_MTIMES = tuple(
+    p.stat().st_mtime_ns
+    for p in (
+        SRC_DIR / "spy_daytrader" / "config.py",
+        SRC_DIR / "spy_daytrader" / "state_store.py",
+        SRC_DIR / "spy_daytrader" / "dashboard_data.py",
+    )
+    if p.exists()
 )
+if getattr(_data_mod, "_LOADED_MTIMES", None) != _MODULE_MTIMES:
+    _cfg_mod = importlib.reload(_cfg_mod)
+    _store_mod = importlib.reload(_store_mod)
+    _data_mod = importlib.reload(_data_mod)
+    setattr(_data_mod, "_LOADED_MTIMES", _MODULE_MTIMES)
+
+BotConfig = _cfg_mod.BotConfig
+DailyPnLRow = _data_mod.DailyPnLRow
+DashboardSnapshot = _data_mod.DashboardSnapshot
+OpenTradeView = _data_mod.OpenTradeView
+OrderJournalRow = _data_mod.OrderJournalRow
+WorkingEntryView = _data_mod.WorkingEntryView
+build_daily_takeaway = _data_mod.build_daily_takeaway
+fetch_dashboard_snapshot = _data_mod.fetch_dashboard_snapshot
+format_eod_close_sgt = _data_mod.format_eod_close_sgt
 
 ALPACA_PAPER_PORTAL_URL = "https://app.alpaca.markets/paper/dashboard/overview"
 
@@ -286,7 +305,11 @@ def _load_bot_config() -> BotConfig:
     except Exception:
         pass
 
-    return BotConfig.from_env(env_file=REPO_ROOT / ".env")
+    cfg = BotConfig.from_env(env_file=REPO_ROOT / ".env")
+    db_p = Path(cfg.state_db_path)
+    if str(cfg.state_db_path) != ":memory:" and not db_p.is_absolute():
+        cfg = cfg.model_copy(update={"state_db_path": str(REPO_ROOT / db_p)})
+    return cfg
 
 
 def _pnl_class(val: float) -> str:
