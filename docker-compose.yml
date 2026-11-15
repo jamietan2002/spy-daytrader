@@ -1,0 +1,17 @@
+services:
+  spy-daytrader:
+    build: .
+    container_name: spy-daytrader
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    environment:
+      - PORT=8501
+      - STATE_DB_PATH=/app/data/bot_state.db
+    volumes:
+      - spy_daytrader_data:/app/data
+
+volumes:
+  spy_daytrader_data:

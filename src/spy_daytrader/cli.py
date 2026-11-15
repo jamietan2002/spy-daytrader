@@ -1,4 +1,4 @@
-"""Command-line interface for running, inspecting, flattening, and backtesting the v2 bot."""
+"""Command-line interface for running, serving live UI+bot, inspecting, flattening, and backtesting."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from spy_daytrader.config import ATRProfile, BotConfig, StrategyMode
 from spy_daytrader.data_feed import NY_TZ, MarketDataFeed
 from spy_daytrader.engine import IntradayTradingBot
 from spy_daytrader.state_store import SQLiteStateLedger
+from spy_daytrader.supervisor import run_live_hub
 
 
 def _format_report_table(reports: list[BacktestReport]) -> str:
@@ -37,7 +38,7 @@ def _format_report_table(reports: list[BacktestReport]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="spy-bot",
-        description="Institutional v2 Intraday Paper Day-Trading Bot & Backtester (alpaca-py + pandas-ta)",
+        description="Institutional v2 Intraday Paper Day-Trading Bot, Minimalist Dark UI & Backtester",
     )
     parser.add_argument(
         "--env-file",
@@ -47,25 +48,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # 1. Live Boundary-Snapped 1-minute Paper Loop
-    p_run = sub.add_parser("run", help="Start the boundary-snapped 1-minute Alpaca Paper trading loop")
+    # 1. Combined Cloud Container Supervisor (Bot Worker + Minimalist Streamlit UI)
+    p_serve = sub.add_parser(
+        "serve",
+        help="Run the autonomous market-hours bot AND Minimalist Dark Web UI in one container process",
+    )
+    p_serve.add_argument("--port", type=int, default=None, help="HTTP port (defaults to $PORT or 8501)")
+    p_serve.add_argument("--host", default="0.0.0.0", help="Bind address (default 0.0.0.0)")
+    p_serve.add_argument("--mode", choices=["alpha_max", "baseline"], default=None)
+    p_serve.add_argument("--atr-profile", choices=["standard", "wide"], default=None)
+    p_serve.add_argument("--symbol", default=None)
+    p_serve.add_argument("--no-bot", action="store_true", help="Serve only the Web UI without background bot")
+    p_serve.add_argument("--dry-run", action="store_true", help="Run bot in dry-run mode alongside live UI")
+
+    # 2. Headless 1-minute Paper Loop
+    p_run = sub.add_parser("run", help="Start the headless boundary-snapped 1-minute Alpaca Paper loop")
     p_run.add_argument("--mode", choices=["alpha_max", "baseline"], default=None)
     p_run.add_argument("--atr-profile", choices=["standard", "wide"], default=None)
     p_run.add_argument("--symbol", default=None, help="Ticker (e.g. SPY, QQQ, TQQQ, NVDA)")
     p_run.add_argument("--dry-run", action="store_true", help="Evaluate signals without submitting orders")
 
-    # 2. Single Evaluation Tick
+    # 3. Single Evaluation Tick
     p_once = sub.add_parser("once", help="Execute a single evaluation cycle and exit")
     p_once.add_argument("--mode", choices=["alpha_max", "baseline"], default=None)
     p_once.add_argument("--atr-profile", choices=["standard", "wide"], default=None)
     p_once.add_argument("--symbol", default=None)
     p_once.add_argument("--dry-run", action="store_true")
 
-    # 3. Account & Exposure Status
+    # 4. Account & Exposure Status
     p_status = sub.add_parser("status", help="Display Alpaca Paper account, clock, ledger, and exposure")
     p_status.add_argument("--symbol", default=None)
 
-    # 4. EOD / Manual Flatten
+    # 5. EOD / Manual Flatten
     p_flat = sub.add_parser("flatten", help="Cancel open orders and flatten open position for symbol")
     p_flat.add_argument("--symbol", default=None)
     p_flat.add_argument(
@@ -74,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also flatten external non-spydt positions on this symbol if present",
     )
 
-    # 5. Historical 5m Backtest & Multi-Symbol / Profile Tournament
+    # 6. Historical 5m Backtest & Multi-Symbol / Profile Tournament
     p_bt = sub.add_parser("backtest", help="Backtest 5m bars across modes, ATR profiles, and symbols")
     p_bt.add_argument("--days", type=int, default=90, help="Calendar lookback days of 5m Alpaca bars")
     p_bt.add_argument("--symbol", default=None)
@@ -100,6 +114,15 @@ def main(argv: list[str] | None = None) -> int:
         symbol_override=getattr(args, "symbol", None),
         atr_profile_override=getattr(args, "atr_profile", None),
     )
+
+    if args.command == "serve":
+        return run_live_hub(
+            cfg,
+            port=args.port,
+            host=args.host,
+            enable_bot=not bool(args.no_bot),
+            dry_run=bool(args.dry_run),
+        )
 
     if args.command == "run":
         bot = IntradayTradingBot(cfg)

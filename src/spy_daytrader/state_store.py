@@ -1,4 +1,4 @@
-"""Crash-safe SQLite state ledger for bar deduplication, bot-owned orders, and bot-scoped P&L."""
+"""Crash-safe SQLite state ledger for bar deduplication, bot-owned orders, heartbeat, and daily P&L."""
 
 from __future__ import annotations
 
@@ -38,6 +38,16 @@ CREATE TABLE IF NOT EXISTS bot_orders (
     submitted_at_utc TEXT NOT NULL,
     updated_at_utc TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS bot_heartbeat (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    symbol TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    market_open INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    next_open_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
 """
 
 
@@ -60,6 +70,18 @@ class TrackedBotOrder:
     session_date: str
     realized_pnl_usd: float
     submitted_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class BotHeartbeat:
+    """Latest background worker heartbeat read by the monitoring UI."""
+
+    symbol: str
+    mode: str
+    market_open: bool
+    status: str
+    next_open_utc: datetime | None
+    updated_at_utc: datetime
 
 
 class SQLiteStateLedger:
@@ -85,6 +107,113 @@ class SQLiteStateLedger:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL;")
         return conn
+
+    def record_heartbeat(
+        self,
+        *,
+        symbol: str,
+        mode: str,
+        market_open: bool,
+        status: str,
+        next_open_utc: datetime | None = None,
+        updated_at_utc: datetime | None = None,
+    ) -> None:
+        now_iso = (updated_at_utc or datetime.now(timezone.utc)).isoformat()
+        next_iso = next_open_utc.isoformat() if next_open_utc is not None else ""
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO bot_heartbeat
+                    (singleton_id, symbol, mode, market_open, status, next_open_utc, updated_at_utc)
+                    VALUES (1, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (symbol.upper(), mode, 1 if market_open else 0, status, next_iso, now_iso),
+                )
+        finally:
+            if self._memory_conn is None:
+                conn.close()
+
+    def get_latest_heartbeat(self) -> BotHeartbeat | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT symbol, mode, market_open, status, next_open_utc, updated_at_utc FROM bot_heartbeat WHERE singleton_id = 1"
+            ).fetchone()
+            if row is None:
+                return None
+            next_dt = (
+                datetime.fromisoformat(row["next_open_utc"])
+                if row["next_open_utc"]
+                else None
+            )
+            upd_dt = datetime.fromisoformat(row["updated_at_utc"])
+            return BotHeartbeat(
+                symbol=str(row["symbol"]),
+                mode=str(row["mode"]),
+                market_open=bool(row["market_open"]),
+                status=str(row["status"]),
+                next_open_utc=next_dt,
+                updated_at_utc=upd_dt,
+            )
+        finally:
+            if self._memory_conn is None:
+                conn.close()
+
+    def list_recent_processed_bars(self, limit: int = 100) -> list[dict[str, str]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT symbol, mode, bar_close_iso, action, reason, created_at_utc
+                FROM processed_bars
+                ORDER BY created_at_utc DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            if self._memory_conn is None:
+                conn.close()
+
+    def list_tracked_orders(self, limit: int = 200) -> list[TrackedBotOrder]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM bot_orders
+                ORDER BY submitted_at_utc DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+            out: list[TrackedBotOrder] = []
+            for r in rows:
+                out.append(
+                    TrackedBotOrder(
+                        client_order_id=str(r["client_order_id"]),
+                        broker_order_id=str(r["broker_order_id"]),
+                        symbol=str(r["symbol"]),
+                        mode=str(r["mode"]),
+                        side=str(r["side"]),
+                        order_type=str(r["order_type"]),
+                        qty=int(r["qty"]),
+                        reference_price=float(r["reference_price"]),
+                        limit_price=float(r["limit_price"]) if r["limit_price"] is not None else None,
+                        stop_loss_price=float(r["stop_loss_price"]),
+                        take_profit_price=float(r["take_profit_price"]),
+                        status=str(r["status"]),
+                        session_date=str(r["session_date"]),
+                        realized_pnl_usd=float(r["realized_pnl_usd"]),
+                        submitted_at_utc=datetime.fromisoformat(r["submitted_at_utc"]),
+                    )
+                )
+            return out
+        finally:
+            if self._memory_conn is None:
+                conn.close()
 
     def has_processed_bar(self, symbol: str, mode: str, bar_close_et: datetime) -> bool:
         iso_key = bar_close_et.isoformat()
@@ -234,4 +363,3 @@ class SQLiteStateLedger:
         finally:
             if self._memory_conn is None:
                 conn.close()
-

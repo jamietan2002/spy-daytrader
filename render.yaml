@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: spy-daytrader
+    runtime: docker
+    plan: starter
+    healthCheckPath: /_stcore/health
+    envVars:
+      - key: ALPACA_PAPER
+        value: "true"
+      - key: ALPACA_BASE_URL
+        value: "https://paper-api.alpaca.markets"
+      - key: ALPACA_DATA_FEED
+        value: "iex"
+      - key: STRATEGY_MODE
+        value: "alpha_max"
+      - key: ATR_PROFILE
+        value: "standard"
+      - key: TRADING_SYMBOL
+        value: "SPY"
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false

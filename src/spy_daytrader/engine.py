@@ -1,4 +1,4 @@
-"""Boundary-snapped 1m execution engine with SQLite crash-safe bar dedup & stale-entry cleanup."""
+"""Boundary-snapped 1m execution engine with SQLite heartbeat, smart off-hours sleep, & bar dedup."""
 
 from __future__ import annotations
 
@@ -20,11 +20,12 @@ from spy_daytrader.strategy import SignalAction, SignalDecision, evaluate_signal
 
 @dataclass(frozen=True)
 class CycleOutcome:
-    """Structured telemetry returned after each 1-minute bot iteration."""
+    """Structured telemetry returned after each bot iteration."""
 
     timestamp_et: datetime
     market_open: bool
     status: str
+    next_open_utc: datetime | None = None
     signal: SignalDecision | None = None
     order_plan: BracketOrderPlan | None = None
     receipt: OrderSubmissionReceipt | None = None
@@ -33,8 +34,9 @@ class CycleOutcome:
 class IntradayTradingBot:
     """
     Production v2 intraday trading engine:
-      - Boundary-snapped 1-minute loop waking at `:00:01.5s` for sub-2s closed-bar execution
-      - Crash-safe SQLite state ledger (`data/bot_state.db`) for bar dedup & bot-scoped P&L
+      - Boundary-snapped 1-minute loop waking at `:00:01.5s` during NYSE market hours
+      - Smart low-power sleep outside market hours (wakes automatically before market open)
+      - Crash-safe SQLite state ledger (`data/bot_state.db`) for heartbeats, bar dedup & P&L
       - Auto-cancels stale unfilled Marketable Limit parent entries after 55s
       - Bot-isolated `spydt-*` 15:55 ET EOD flatten protecting external account holdings
     """
@@ -60,6 +62,23 @@ class IntradayTradingBot:
         self.logger.info("Graceful shutdown signal received; finishing current cycle...")
         self._running = False
 
+    def _record_hb(
+        self,
+        *,
+        market_open: bool,
+        status: str,
+        next_open_utc: datetime | None,
+        now_utc: datetime,
+    ) -> None:
+        self.ledger.record_heartbeat(
+            symbol=self.config.symbol,
+            mode=self.config.strategy_mode.value,
+            market_open=market_open,
+            status=status,
+            next_open_utc=next_open_utc,
+            updated_at_utc=now_utc,
+        )
+
     def run_once(self, *, dry_run: bool = False) -> CycleOutcome:
         """Execute a single 1-minute supervision & signal evaluation cycle."""
         now_utc = self._now_fn()
@@ -70,6 +89,7 @@ class IntradayTradingBot:
 
         clock = self.broker.get_market_clock()
         account = self.broker.get_account_snapshot()
+        next_open_utc = clock.next_open.astimezone(timezone.utc)
 
         if not clock.is_open:
             self.logger.info(
@@ -79,35 +99,42 @@ class IntradayTradingBot:
                 account.equity,
                 self.config.strategy_mode.value,
             )
+            self._record_hb(
+                market_open=False,
+                status="MARKET_CLOSED",
+                next_open_utc=next_open_utc,
+                now_utc=now_utc,
+            )
             return CycleOutcome(
                 timestamp_et=now_et,
                 market_open=False,
                 status="MARKET_CLOSED",
+                next_open_utc=next_open_utc,
             )
 
         # 1. EOD Intraday Flatten Guard (>= 15:55 ET) — isolated to spydt-* owned exposure
         if now_et.time() >= self.config.eod_flatten_et:
+            status_code = "EOD_NO_NEW_ENTRIES"
             if not dry_run:
                 flatten_res = self.broker.flatten_symbol_eod(
                     self.config.symbol,
                     session_date=session_date,
                 )
                 if flatten_res["closed_position"] or flatten_res["cancelled_order_ids"]:
-                    return CycleOutcome(
-                        timestamp_et=now_et,
-                        market_open=True,
-                        status="EOD_FLATTENED",
-                    )
-                if flatten_res.get("protected_external"):
-                    return CycleOutcome(
-                        timestamp_et=now_et,
-                        market_open=True,
-                        status="EOD_EXTERNAL_POSITION_PROTECTED",
-                    )
+                    status_code = "EOD_FLATTENED"
+                elif flatten_res.get("protected_external"):
+                    status_code = "EOD_EXTERNAL_POSITION_PROTECTED"
+            self._record_hb(
+                market_open=True,
+                status=status_code,
+                next_open_utc=next_open_utc,
+                now_utc=now_utc,
+            )
             return CycleOutcome(
                 timestamp_et=now_et,
                 market_open=True,
-                status="EOD_NO_NEW_ENTRIES",
+                status=status_code,
+                next_open_utc=next_open_utc,
             )
 
         # 2. Reconcile & auto-cancel stale unfilled parent Marketable Limit entries (> 55s old)
@@ -143,28 +170,51 @@ class IntradayTradingBot:
         )
 
         if has_exposure:
+            status_str = f"HOLDING_OR_WORKING:{exposure_desc}"
+            self._record_hb(
+                market_open=True,
+                status=status_str,
+                next_open_utc=next_open_utc,
+                now_utc=now_utc,
+            )
             return CycleOutcome(
                 timestamp_et=now_et,
                 market_open=True,
-                status=f"HOLDING_OR_WORKING:{exposure_desc}",
+                status=status_str,
+                next_open_utc=next_open_utc,
                 signal=decision,
             )
 
         if decision.action == SignalAction.NONE or decision.bar_close_et is None:
+            status_str = f"NO_TRADE:{decision.reason}"
+            self._record_hb(
+                market_open=True,
+                status=status_str,
+                next_open_utc=next_open_utc,
+                now_utc=now_utc,
+            )
             return CycleOutcome(
                 timestamp_et=now_et,
                 market_open=True,
-                status=f"NO_TRADE:{decision.reason}",
+                status=status_str,
+                next_open_utc=next_open_utc,
                 signal=decision,
             )
 
-        # 4. Crash-safe SQLite deduplication: never evaluate/submit twice on the same closed 5m bar
+        # 4. Crash-safe SQLite deduplication
         mode_str = self.config.strategy_mode.value
         if self.ledger.has_processed_bar(self.config.symbol, mode_str, decision.bar_close_et):
+            self._record_hb(
+                market_open=True,
+                status="BAR_ALREADY_PROCESSED",
+                next_open_utc=next_open_utc,
+                now_utc=now_utc,
+            )
             return CycleOutcome(
                 timestamp_et=now_et,
                 market_open=True,
                 status="BAR_ALREADY_PROCESSED",
+                next_open_utc=next_open_utc,
                 signal=decision,
             )
 
@@ -192,17 +242,25 @@ class IntradayTradingBot:
                 self.config.symbol,
                 plan.veto_reason,
             )
+            status_str = f"RISK_VETO:{plan.veto_reason}"
             self.ledger.mark_bar_processed(
                 self.config.symbol,
                 mode_str,
                 decision.bar_close_et,
                 decision.action.value,
-                f"RISK_VETO:{plan.veto_reason}",
+                status_str,
+            )
+            self._record_hb(
+                market_open=True,
+                status=status_str,
+                next_open_utc=next_open_utc,
+                now_utc=now_utc,
             )
             return CycleOutcome(
                 timestamp_et=now_et,
                 market_open=True,
-                status=f"RISK_VETO:{plan.veto_reason}",
+                status=status_str,
+                next_open_utc=next_open_utc,
                 signal=decision,
                 order_plan=plan,
             )
@@ -227,10 +285,17 @@ class IntradayTradingBot:
                 decision.action.value,
                 "DRY_RUN_APPROVED",
             )
+            self._record_hb(
+                market_open=True,
+                status="DRY_RUN_APPROVED",
+                next_open_utc=next_open_utc,
+                now_utc=now_utc,
+            )
             return CycleOutcome(
                 timestamp_et=now_et,
                 market_open=True,
                 status="DRY_RUN_APPROVED",
+                next_open_utc=next_open_utc,
                 signal=decision,
                 order_plan=plan,
             )
@@ -243,10 +308,20 @@ class IntradayTradingBot:
             decision.action.value,
             f"SUBMITTED:{receipt.status}",
         )
+        final_status = (
+            "ORDER_SUBMITTED" if receipt.submitted else f"ORDER_NOT_SUBMITTED:{receipt.status}"
+        )
+        self._record_hb(
+            market_open=True,
+            status=final_status,
+            next_open_utc=next_open_utc,
+            now_utc=now_utc,
+        )
         return CycleOutcome(
             timestamp_et=now_et,
             market_open=True,
-            status="ORDER_SUBMITTED" if receipt.submitted else f"ORDER_NOT_SUBMITTED:{receipt.status}",
+            status=final_status,
+            next_open_utc=next_open_utc,
             signal=decision,
             order_plan=plan,
             receipt=receipt,
@@ -257,10 +332,17 @@ class IntradayTradingBot:
         *,
         dry_run: bool = False,
         max_cycles: int | None = None,
+        register_signals: bool = True,
     ) -> None:
-        """Run the boundary-snapped (`:00:01.5s`) 1-minute intraday trading loop."""
-        signal.signal(signal.SIGINT, self.request_stop)
-        signal.signal(signal.SIGTERM, self.request_stop)
+        """
+        Run the autonomous 24/7 loop:
+          - During market hours: boundary-snapped (`:00:01.5s`) 1-minute precision polling.
+          - Outside market hours: low-overhead 5-minute heartbeat checks, switching back to
+            1-minute precision automatically 2 minutes before NYSE market open.
+        """
+        if register_signals:
+            signal.signal(signal.SIGINT, self.request_stop)
+            signal.signal(signal.SIGTERM, self.request_stop)
 
         self.logger.info(
             "Starting IntradayTradingBot v2 | symbol=%s | mode=%s | atr_profile=%s (%.2fx/%.2fx) | "
@@ -279,10 +361,11 @@ class IntradayTradingBot:
         cycles = 0
         while self._running:
             cycle_started = time_mod.monotonic()
+            outcome: CycleOutcome | None = None
             try:
-                self.run_once(dry_run=dry_run)
+                outcome = self.run_once(dry_run=dry_run)
             except Exception as exc:
-                self.logger.exception("Unhandled error in 1-minute trading cycle (recovering): %s", exc)
+                self.logger.exception("Unhandled error in trading cycle (recovering): %s", exc)
 
             cycles += 1
             if max_cycles is not None and cycles >= max_cycles:
@@ -293,7 +376,17 @@ class IntradayTradingBot:
             now = time_mod.time()
             interval = float(self.config.poll_interval_seconds)
             elapsed = time_mod.monotonic() - cycle_started
-            if interval == 60.0:
+
+            # Smart off-hours sleep: check every <=300s until 2 minutes before next NYSE open
+            if outcome is not None and not outcome.market_open and outcome.next_open_utc is not None:
+                until_open = (
+                    outcome.next_open_utc - datetime.now(timezone.utc)
+                ).total_seconds()
+                if until_open > 150.0:
+                    sleep_sec = min(300.0, max(30.0, until_open - 90.0))
+                else:
+                    sleep_sec = max(1.0, (60.0 - (now % 60.0)) + self.config.boundary_wakeup_offset_sec)
+            elif interval == 60.0:
                 sleep_sec = max(
                     0.5,
                     (60.0 - (now % 60.0)) + self.config.boundary_wakeup_offset_sec,
