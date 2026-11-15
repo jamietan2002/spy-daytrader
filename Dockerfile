@@ -3,19 +3,19 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app/src \
     PORT=8501 \
     STATE_DB_PATH=/app/data/bot_state.db
 
 WORKDIR /app
 
-COPY pyproject.toml requirements.txt README.md main.py ./
+COPY requirements.txt pytest.ini README.md main.py ./
 COPY src ./src
 COPY dashboard ./dashboard
 COPY .streamlit ./.streamlit
 
 RUN pip install --upgrade pip && \
     pip install -r requirements.txt && \
-    pip install --no-build-isolation --no-deps -e . && \
     mkdir -p /app/data
 
 EXPOSE 8501

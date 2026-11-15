@@ -27,8 +27,7 @@ See [**DEPLOYMENT.md**](./DEPLOYMENT.md) for the 1-minute Streamlit Community Cl
 ### 2. Local Setup & Live Hub
 ```bash
 /Library/GoogleCorpSupport/Python/3.11/bin/python3.11 -m venv .venv
-.venv/bin/pip install --only-binary :all: -r requirements.txt
-.venv/bin/pip install --no-build-isolation --no-deps -e .
+.venv/bin/pip install --only-binary :all: -r requirements.txt pytest pytest-cov
 
 cp .env.example .env
 # Add your dedicated Alpaca Paper API Key & Secret Key to .env
