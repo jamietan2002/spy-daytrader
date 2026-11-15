@@ -9,10 +9,11 @@ An institutional-grade Python intraday paper-trading bot, Minimalist Matte-Dark 
 1. **100% Free-Forever Autonomous Hosting (`GitHub Actions` + `Streamlit Community Cloud`)**:
    - **Market-Hours Session Runner ([`.github/workflows/intraday_session.yml`](./.github/workflows/intraday_session.yml))**: Two overlap-safe scheduled workflows (`Morning 13:20 UTC` + `Afternoon 16:50 UTC` with `concurrency` handoff) wake boundary-snapped at `:00:01.5s` every minute across the full `09:30–16:00 ET` (`21:30–04:00 SGT`) NYSE session, exit immediately on holidays, flatten 5 minutes before close (`15:55 ET` or `12:55 ET` on early-close half-days), and sync `data/bot_state.db` back to `main` — `$0/month` forever with no 30-day trial expiry.
    - **Single-Container Local / Docker Supervisor (`python main.py serve`)**: Can also run both the background bot worker and Streamlit UI in one self-healing process locally or via Docker.
-2. **Minimalist Matte-Dark 2-Tab Web UI (`dashboard/streamlit_app.py`)**:
+2. **Minimalist Matte-Dark 2-Tab Web UI (`dashboard/streamlit_app.py` + `live_stream.py`)**:
+   - **Event-Driven Broker Fill Stream (`TradingStream` WebSocket + RAM Cache)**: Subscribes a single background `@st.cache_resource` daemon thread to `wss://paper-api.alpaca.markets/stream` (`trade_updates`), serving every tab and journal click from RAM in `<0.5 ms` with zero polling lag and reacting immediately whenever an actual order or fill occurs (falling back cleanly to `mtime`-cached `data/bot_state.db` if Streamlit Secrets are omitted).
    - **`Today & Open Trade`**: Real-time Paper equity, today's P&L, 30-day realized P&L & win rate, active trade details (`Shares`, `Entry / Current Price`, `Unrealized P&L`, `Auto Stop-Loss`, `Profit Target`, `Mandatory Close` in `SGT`), and today's fills in plain everyday English.
    - **`Daily P&L & Journal`**: Day-by-day P&L history table plus a focused single-day journal (`← Previous` / `Next →`) with a 1-sentence `Daily Takeaway` banner and `Date / Time (SGT)` timestamps.
-   - Zero emojis, no left sidebar, no manual sync clutter (auto-refreshes every `30s`).
+   - Zero emojis, no left sidebar, no manual sync clutter.
 3. **Hard Paper-Trading Safety Lock & Dedicated Account Isolation (`spydt-*`)**:
    - Refuses to start unless `ALPACA_PAPER=true` and `ALPACA_BASE_URL=https://paper-api.alpaca.markets` (`LiveTradingProhibitedError`).
    - Dedicated to isolated Alpaca Paper Account #3 (`PA3OSGSIE`) with WAL-mode SQLite ledger (`data/bot_state.db`), `-2.5%` daily drawdown circuit breaker, and `15:55 ET` EOD flatten.

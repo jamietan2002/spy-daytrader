@@ -115,6 +115,7 @@ class DashboardSnapshot:
     skipped_by_day: dict[date, list[SkippedCheckRow]]
     daily_pnl_rows: list[DailyPnLRow]
     available_days: list[date]
+    next_open_utc: datetime | None = None
 
 
 def format_sgt(dt: datetime | None) -> str:
@@ -217,6 +218,7 @@ def build_header_status(
     next_open_utc: datetime | None,
     heartbeat: BotHeartbeat | None,
     reference_utc: datetime | None = None,
+    stream_connected: bool = False,
 ) -> str:
     """Build a 1-line calm header status in SGT without emojis or technical codes."""
     ref = reference_utc or datetime.now(timezone.utc)
@@ -231,11 +233,17 @@ def build_header_status(
         hb_is_fresh = abs((ref - hb_ts).total_seconds()) <= 600.0
 
     if market_open:
+        if stream_connected:
+            if heartbeat is not None and hb_is_fresh:
+                return f"US Market Open · Live fill stream active · Last checked {format_sgt(heartbeat.updated_at_utc)}"
+            return "US Market Open · Live fill stream active · Connected to Alpaca Paper"
         if heartbeat is not None and hb_is_fresh:
             return f"US Market Open · Autonomous bot active · Last checked {format_sgt(heartbeat.updated_at_utc)}"
         return "US Market Open · Autonomous bot active · Connected to Alpaca Paper"
 
     next_open_str = format_sgt(next_open_utc)
+    if stream_connected:
+        return f"US Market Closed · Live fill stream standing by · Next session opens {next_open_str}"
     if heartbeat is not None and hb_is_fresh:
         return f"US Market Closed · Next session opens {next_open_str} · Bot standing by (checked {format_sgt(heartbeat.updated_at_utc)})"
     return f"US Market Closed · Next session opens {next_open_str}"
@@ -425,6 +433,7 @@ def fetch_dashboard_snapshot(
         skipped_by_day=skipped_by_day,
         daily_pnl_rows=daily_pnl_rows,
         available_days=available_days,
+        next_open_utc=next_open_utc,
     )
     state_ledger.save_dashboard_cache(
         _serialize_snapshot(snap, next_open_utc=next_open_utc),
@@ -1105,6 +1114,7 @@ def _load_or_build_offline_snapshot(
             skipped_by_day=skipped_by_day,
             daily_pnl_rows=daily_pnl_rows,
             available_days=sorted(all_days, reverse=True),
+            next_open_utc=next_open_utc,
         )
 
     fallback_row = DailyPnLRow(
@@ -1135,5 +1145,6 @@ def _load_or_build_offline_snapshot(
         skipped_by_day=skipped_by_day,
         daily_pnl_rows=[fallback_row],
         available_days=[today_ny],
+        next_open_utc=next_open_utc,
     )
 

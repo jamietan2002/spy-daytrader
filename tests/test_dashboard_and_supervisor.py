@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import re
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +15,9 @@ from streamlit.testing.v1 import AppTest
 
 from spy_daytrader.config import BotConfig
 from spy_daytrader.dashboard_data import (
+    DailyPnLRow,
+    DashboardSnapshot,
+    OpenTradeView,
     build_daily_takeaway,
     build_header_status,
     fetch_dashboard_snapshot,
@@ -21,6 +26,7 @@ from spy_daytrader.dashboard_data import (
     translate_order_status,
     translate_skip_reason,
 )
+from spy_daytrader.live_stream import BrokerTradeStreamHub
 from spy_daytrader.state_store import BotHeartbeat, SQLiteStateLedger
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +45,7 @@ def test_zero_emojis_and_python311_syntax_across_ui_and_data_modules() -> None:
     targets = [
         REPO_ROOT / "dashboard" / "streamlit_app.py",
         REPO_ROOT / "src" / "spy_daytrader" / "dashboard_data.py",
+        REPO_ROOT / "src" / "spy_daytrader" / "live_stream.py",
         REPO_ROOT / "src" / "spy_daytrader" / "supervisor.py",
     ]
     for path in targets:
@@ -269,4 +276,151 @@ def test_streamlit_app_renders_headlessly_without_exceptions(monkeypatch: pytest
     assert "Missing ALPACA_API_KEY" not in rendered_html
     assert "Connection Configuration Needed" not in rendered_html
     assert "$100,000.00" in rendered_html
+
+
+def test_broker_trade_stream_hub_event_driven_fills_and_zero_polling_when_flat(tmp_path: Path) -> None:
+    now_utc = datetime(2026, 11, 16, 15, 10, tzinfo=timezone.utc)  # Mon 10:10 ET (market open)
+    clock_mono = [1000.0]
+    fetch_count = [0]
+    hold_open_trade = [False]
+
+    def _fake_fetch(cfg: BotConfig) -> DashboardSnapshot:
+        fetch_count[0] += 1
+        d_ny = date(2026, 11, 16)
+        ot = (
+            OpenTradeView(
+                symbol=cfg.symbol,
+                direction_label="Long (Bought)",
+                shares=100,
+                entry_price=580.0,
+                current_price=581.5,
+                market_value_usd=58150.0,
+                unrealized_pnl_usd=150.0,
+                unrealized_pnl_pct=0.26,
+                stop_loss_price=578.0,
+                max_loss_usd=200.0,
+                profit_target_price=583.0,
+                target_gain_usd=300.0,
+                mandatory_close_label="04:55 SGT",
+                plain_summary="Bought 100 shares of SPY.",
+            )
+            if hold_open_trade[0]
+            else None
+        )
+        return DashboardSnapshot(
+            symbol=cfg.symbol,
+            equity_usd=100_000.0 + (150.0 if ot else 0.0),
+            cash_usd=100_000.0,
+            buying_power_usd=400_000.0,
+            today_pnl_usd=150.0 if ot else 0.0,
+            today_pnl_pct=0.15 if ot else 0.0,
+            market_open=True,
+            header_status_line="US Market Open · Autonomous bot active · Connected to Alpaca Paper",
+            closed_trades_30d=0,
+            win_rate_30d_pct=None,
+            net_pnl_30d_usd=0.0,
+            open_trade=ot,
+            working_entry=None,
+            orders_by_day={},
+            skipped_by_day={},
+            daily_pnl_rows=[
+                DailyPnLRow(
+                    session_date=d_ny,
+                    date_label="Mon, Nov 16, 2026",
+                    trades_closed=0,
+                    wins=0,
+                    losses=0,
+                    day_pnl_usd=0.0,
+                    day_return_pct=0.0,
+                    ending_equity_usd=100_000.0,
+                )
+            ],
+            available_days=[d_ny],
+            next_open_utc=now_utc + timedelta(days=1),
+        )
+
+    subscribed_handlers: list[object] = []
+
+    class FakeTradingStream:
+        def __init__(self) -> None:
+            self._running = False
+
+        def subscribe_trade_updates(self, handler: object) -> None:
+            subscribed_handlers.append(handler)
+
+        def run(self) -> None:
+            self._running = True
+            while self._running:
+                time.sleep(0.02)
+
+        def stop(self) -> None:
+            self._running = False
+
+    cfg = BotConfig(
+        alpaca_api_key="paper-key",
+        alpaca_secret_key="paper-secret",
+        state_db_path=str(tmp_path / "stream.db"),
+    )
+    hub = BrokerTradeStreamHub(
+        cfg,
+        fetch_fn=_fake_fetch,
+        stream_factory=lambda _c: FakeTradingStream(),
+        enable_websocket=True,
+        coalesce_delay_sec=0.0,
+        open_position_refresh_sec=60.0,
+        monotonic_fn=lambda: clock_mono[0],
+        now_fn=lambda: now_utc,
+    ).start()
+
+    try:
+        # Wait briefly for FakeTradingStream daemon thread to enter run()
+        deadline = time.time() + 2.0
+        while not hub.stream_connected and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert hub.stream_connected is True
+        assert len(subscribed_handlers) == 1
+        assert fetch_count[0] == 1
+
+        # 1. Repeated UI interactions while flat must do ZERO extra REST fetches
+        clock_mono[0] += 120.0
+        snap1, v1, live1 = hub.get_snapshot(cfg)
+        snap2, _v2, _live2 = hub.get_snapshot(cfg)
+        assert live1 is True
+        assert "Live fill stream active" in snap1.header_status_line
+        assert snap2.equity_usd == 100_000.0
+        assert fetch_count[0] == 1
+
+        # 2. Irrelevant event does not hit REST API
+        asyncio.run(
+            hub.handle_trade_update(
+                SimpleNamespace(event="pending_cancel", order=SimpleNamespace(symbol="SPY"))
+            )
+        )
+        assert fetch_count[0] == 1
+
+        # 3. Live Alpaca `fill` event wakes hub, refreshes RAM snapshot, and increments `version`
+        hold_open_trade[0] = True
+        asyncio.run(
+            hub.handle_trade_update(
+                SimpleNamespace(event="OrderEvent.FILL", order=SimpleNamespace(symbol="SPY"))
+            )
+        )
+        snap3, v3, _ = hub.get_snapshot(cfg)
+        assert fetch_count[0] == 2
+        assert v3 > v1
+        assert hub.last_event_name == "fill"
+        assert snap3.open_trade is not None
+        assert snap3.equity_usd == 100_150.0
+
+        # 4. While holding an open trade, advancing >=60s triggers one non-blocking mark-to-market refresh
+        clock_mono[0] += 65.0
+        hub.check_background_refresh(cfg)
+        deadline = time.time() + 2.0
+        while fetch_count[0] < 3 and time.time() < deadline:
+            time.sleep(0.01)
+        assert fetch_count[0] == 3
+    finally:
+        hub.stop()
+
 

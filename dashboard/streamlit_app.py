@@ -10,12 +10,14 @@ Linear / Apple Stocks Aesthetic:
 
 from __future__ import annotations
 
+from datetime import date, datetime, timezone
+import hashlib
 import html
 import importlib
 import os
 import sys
-from datetime import date
 from pathlib import Path
+from typing import Any
 
 import streamlit as st
 
@@ -27,6 +29,7 @@ if str(SRC_DIR) not in sys.path:
 import spy_daytrader.config as _cfg_mod  # noqa: E402
 import spy_daytrader.state_store as _store_mod  # noqa: E402
 import spy_daytrader.dashboard_data as _data_mod  # noqa: E402
+import spy_daytrader.live_stream as _stream_mod  # noqa: E402
 
 # Hot-reload submodules in long-lived Streamlit Cloud processes whenever Git pulls updates to `src/`
 _MODULE_MTIMES = tuple(
@@ -35,16 +38,20 @@ _MODULE_MTIMES = tuple(
         SRC_DIR / "spy_daytrader" / "config.py",
         SRC_DIR / "spy_daytrader" / "state_store.py",
         SRC_DIR / "spy_daytrader" / "dashboard_data.py",
+        SRC_DIR / "spy_daytrader" / "live_stream.py",
     )
     if p.exists()
 )
-if getattr(_data_mod, "_LOADED_MTIMES", None) != _MODULE_MTIMES:
+if getattr(_stream_mod, "_LOADED_MTIMES", None) != _MODULE_MTIMES:
     _cfg_mod = importlib.reload(_cfg_mod)
     _store_mod = importlib.reload(_store_mod)
     _data_mod = importlib.reload(_data_mod)
-    setattr(_data_mod, "_LOADED_MTIMES", _MODULE_MTIMES)
+    _stream_mod = importlib.reload(_stream_mod)
+    setattr(_stream_mod, "_LOADED_MTIMES", _MODULE_MTIMES)
+    st.cache_resource.clear()
 
 BotConfig = _cfg_mod.BotConfig
+BrokerTradeStreamHub = _stream_mod.BrokerTradeStreamHub
 DailyPnLRow = _data_mod.DailyPnLRow
 DashboardSnapshot = _data_mod.DashboardSnapshot
 OpenTradeView = _data_mod.OpenTradeView
@@ -586,11 +593,64 @@ def _day_option_label(d: date, count: int, is_latest: bool) -> str:
     return f"{d.strftime('%a, %b %d')} · {count} {ord_word}{suffix}"
 
 
-@st.fragment(run_every="30s")
+def _hub_cache_key(cfg: BotConfig) -> tuple[str, ...]:
+    key_fp = (
+        hashlib.sha256(cfg.alpaca_api_key.encode("utf-8")).hexdigest()[:12]
+        if cfg.alpaca_api_key.strip()
+        else "offline"
+    )
+    ws_disabled = os.getenv("DISABLE_UI_WEBSOCKET", "").strip().lower() in {"1", "true", "yes"}
+    return (
+        cfg.symbol,
+        cfg.strategy_mode.value,
+        cfg.atr_profile.value,
+        key_fp,
+        str(cfg.state_db_path),
+        "nows" if ws_disabled else "ws",
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def _get_broker_stream_hub(cache_key: tuple[str, ...], _cfg: BotConfig) -> Any:
+    enable_ws = cache_key[-1] == "ws"
+    hub = BrokerTradeStreamHub(_cfg, enable_websocket=enable_ws)
+    return hub.start()
+
+
+def _should_mount_session_watcher(snap: DashboardSnapshot) -> bool:
+    """Only mount the lightweight in-memory version watcher during or right before market hours."""
+    if snap.market_open:
+        return True
+    if snap.next_open_utc is not None:
+        now_utc = datetime.now(timezone.utc)
+        nxt = (
+            snap.next_open_utc
+            if snap.next_open_utc.tzinfo is not None
+            else snap.next_open_utc.replace(tzinfo=timezone.utc)
+        )
+        seconds_until_open = (nxt - now_utc).total_seconds()
+        if -300.0 <= seconds_until_open <= 900.0:
+            return True
+    return False
+
+
+@st.fragment(run_every="4s")
+def _watch_live_stream_version(_hub: Any, _cfg: Any) -> None:
+    """Zero-I/O RAM version check; triggers full UI rerun ONLY when a new fill/snapshot arrives."""
+    _hub.check_background_refresh(_cfg)
+    cur_ver = _hub.version
+    prev_ver = st.session_state.get("_seen_hub_version", cur_ver)
+    if cur_ver != prev_ver:
+        st.session_state["_seen_hub_version"] = cur_ver
+        st.rerun()
+
+
 def _render_live_dashboard() -> None:
     try:
         cfg = _load_bot_config()
-        snap = fetch_dashboard_snapshot(cfg)
+        hub = _get_broker_stream_hub(_hub_cache_key(cfg), cfg)
+        snap, stream_ver, _ws_connected = hub.get_snapshot(cfg)
+        st.session_state["_seen_hub_version"] = stream_ver
     except Exception as exc:
         err_msg = html.escape(str(exc))
         st.markdown(
@@ -715,6 +775,9 @@ def _render_live_dashboard() -> None:
                     f"<tbody>{skip_rows_html}</tbody></table></div>",
                     unsafe_allow_html=True,
                 )
+
+    if _should_mount_session_watcher(snap):
+        _watch_live_stream_version(hub, cfg)
 
 
 def main() -> None:

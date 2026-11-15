@@ -23,6 +23,7 @@
 | `.github/workflows/intraday_session.yml` | Free-forever Morning + Afternoon NYSE market-hours GitHub Actions runner & SQLite sync |
 | `src/spy_daytrader/supervisor.py` | Single-container Cloud Supervisor (background bot thread + Streamlit `$PORT` server) |
 | `dashboard/streamlit_app.py` | Minimalist Matte-Dark 2-Tab UI (`Today & Open Trade`, `Daily P&L & Journal`) |
+| `src/spy_daytrader/live_stream.py` | Event-driven Alpaca `TradingStream` WebSocket listener & `@st.cache_resource` RAM snapshot hub |
 | `src/spy_daytrader/dashboard_data.py` | Live Alpaca + SQLite plain-English telemetry, round-trip P&L, & SGT formatting |
 | `src/spy_daytrader/config.py` | Frozen Pydantic config, `StrategyMode`, `ATRProfile`, Paper-mode lock |
 | `src/spy_daytrader/data_feed.py` | Alpaca 5m RTH closed-bar feed (`IEX`/`SIP` auto-fallback) & live NBBO quote anchor |
