@@ -2,7 +2,7 @@ services:
   - type: web
     name: spy-daytrader
     runtime: docker
-    plan: starter
+    plan: free
     healthCheckPath: /_stcore/health
     envVars:
       - key: ALPACA_PAPER

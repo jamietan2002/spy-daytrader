@@ -5,7 +5,7 @@ from __future__ import annotations
 import signal
 import time as time_mod
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from typing import Callable
 
 from spy_daytrader.broker import AlpacaPaperBroker, OrderSubmissionReceipt
@@ -112,8 +112,16 @@ class IntradayTradingBot:
                 next_open_utc=next_open_utc,
             )
 
-        # 1. EOD Intraday Flatten Guard (>= 15:55 ET) — isolated to spydt-* owned exposure
-        if now_et.time() >= self.config.eod_flatten_et:
+        # 1. EOD Intraday Flatten Guard (>= 15:55 ET or <= 5m before early-close half-day)
+        next_close_utc = (
+            clock.next_close.astimezone(timezone.utc) if clock.next_close is not None else None
+        )
+        seconds_to_close = (
+            (next_close_utc - now_utc).total_seconds()
+            if next_close_utc is not None
+            else 999_999.0
+        )
+        if now_et.time() >= self.config.eod_flatten_et or (0.0 <= seconds_to_close <= 300.0):
             status_code = "EOD_NO_NEW_ENTRIES"
             if not dry_run:
                 flatten_res = self.broker.flatten_symbol_eod(
@@ -401,3 +409,116 @@ class IntradayTradingBot:
                 slept += step
 
         self.logger.info("IntradayTradingBot stopped cleanly after %d cycle(s).", cycles)
+
+    def run_market_session(
+        self,
+        *,
+        until_et: time | None = None,
+        dry_run: bool = False,
+        max_cycles: int | None = None,
+        register_signals: bool = True,
+    ) -> int:
+        """
+        Bounded NYSE market-session runner tailored for Free-Forever GitHub Actions crons:
+          1. Exits immediately (0s wasted) on weekends, NYSE holidays, or if today's session already closed.
+          2. If launched pre-open on an active trading day, waits cleanly until NYSE market open.
+          3. Polls boundary-snapped every 1 minute (`:00:01.5s`) until `until_et` handoff or market close.
+        """
+        if register_signals:
+            signal.signal(signal.SIGINT, self.request_stop)
+            signal.signal(signal.SIGTERM, self.request_stop)
+
+        now_utc = self._now_fn()
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.replace(tzinfo=timezone.utc)
+        now_et = now_utc.astimezone(NY_TZ)
+
+        if until_et is not None and now_et.time() >= until_et:
+            self.logger.info(
+                "Current time %s ET is already >= session cutoff %s ET; exiting cleanly.",
+                now_et.strftime("%H:%M:%S"),
+                until_et.strftime("%H:%M"),
+            )
+            return 0
+
+        clock = self.broker.get_market_clock()
+        next_open_et = clock.next_open.astimezone(NY_TZ)
+
+        if not clock.is_open and next_open_et.date() != now_et.date():
+            self.logger.info(
+                "No remaining NYSE session today (%s ET; next open %s ET). Recording heartbeat and exiting.",
+                now_et.strftime("%Y-%m-%d %H:%M"),
+                next_open_et.strftime("%Y-%m-%d %H:%M"),
+            )
+            self.run_once(dry_run=dry_run)
+            return 0
+
+        # Pre-market standby on an active trading day
+        if not clock.is_open and next_open_et.date() == now_et.date():
+            wait_sec = max(0.0, (clock.next_open.astimezone(timezone.utc) - now_utc).total_seconds() - 2.0)
+            self.logger.info(
+                "Active trading day pre-open (%s ET); waiting %.0fs for NYSE open at %s ET...",
+                now_et.strftime("%H:%M:%S"),
+                wait_sec,
+                next_open_et.strftime("%H:%M"),
+            )
+            self._record_hb(
+                market_open=False,
+                status="PRE_MARKET_STANDBY",
+                next_open_utc=clock.next_open.astimezone(timezone.utc),
+                now_utc=now_utc,
+            )
+            slept = 0.0
+            while self._running and slept < wait_sec:
+                cur_et = self._now_fn().astimezone(NY_TZ)
+                if until_et is not None and cur_et.time() >= until_et:
+                    return 0
+                step = min(0.5, wait_sec - slept)
+                time_mod.sleep(step)
+                slept += step
+
+        saw_market_open = bool(clock.is_open)
+        cycles = 0
+        while self._running:
+            cycle_started = time_mod.monotonic()
+            outcome: CycleOutcome | None = None
+            try:
+                outcome = self.run_once(dry_run=dry_run)
+                if outcome.market_open:
+                    saw_market_open = True
+            except Exception as exc:
+                self.logger.exception("Unhandled error in session cycle (recovering): %s", exc)
+
+            cycles += 1
+            if max_cycles is not None and cycles >= max_cycles:
+                break
+            if not self._running:
+                break
+
+            cur_et = self._now_fn().astimezone(NY_TZ)
+            if until_et is not None and cur_et.time() >= until_et:
+                self.logger.info(
+                    "Reached scheduled session handoff (%s ET); exiting cleanly.",
+                    until_et.strftime("%H:%M"),
+                )
+                break
+            if saw_market_open and outcome is not None and not outcome.market_open:
+                self.logger.info("NYSE market session closed for today; exiting cleanly.")
+                break
+
+            now_epoch = time_mod.time()
+            interval = float(self.config.poll_interval_seconds)
+            elapsed = time_mod.monotonic() - cycle_started
+            if interval == 60.0:
+                sleep_sec = max(0.5, (60.0 - (now_epoch % 60.0)) + self.config.boundary_wakeup_offset_sec)
+            else:
+                sleep_sec = max(0.5, interval - elapsed)
+
+            slept = 0.0
+            while self._running and slept < sleep_sec:
+                step = min(0.5, sleep_sec - slept)
+                time_mod.sleep(step)
+                slept += step
+
+        self.logger.info("Session runner finished cleanly after %d cycle(s).", cycles)
+        return 0

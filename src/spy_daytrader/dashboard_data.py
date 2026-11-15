@@ -215,15 +215,27 @@ def build_header_status(
     market_open: bool,
     next_open_utc: datetime | None,
     heartbeat: BotHeartbeat | None,
+    reference_utc: datetime | None = None,
 ) -> str:
     """Build a 1-line calm header status in SGT without emojis or technical codes."""
+    ref = reference_utc or datetime.now(timezone.utc)
+    if ref.tzinfo is None:
+        ref = ref.replace(tzinfo=timezone.utc)
+
+    hb_is_fresh = False
+    if heartbeat is not None:
+        hb_ts = heartbeat.updated_at_utc
+        if hb_ts.tzinfo is None:
+            hb_ts = hb_ts.replace(tzinfo=timezone.utc)
+        hb_is_fresh = abs((ref - hb_ts).total_seconds()) <= 600.0
+
     if market_open:
-        if heartbeat is not None:
+        if heartbeat is not None and hb_is_fresh:
             return f"US Market Open · Autonomous bot active · Last checked {format_sgt(heartbeat.updated_at_utc)}"
-        return "US Market Open · Connected to Alpaca Paper Account"
+        return "US Market Open · Autonomous bot active · Connected to Alpaca Paper"
 
     next_open_str = format_sgt(next_open_utc)
-    if heartbeat is not None:
+    if heartbeat is not None and hb_is_fresh:
         return f"US Market Closed · Next session opens {next_open_str} · Bot standing by (checked {format_sgt(heartbeat.updated_at_utc)})"
     return f"US Market Closed · Next session opens {next_open_str}"
 
@@ -335,6 +347,7 @@ def fetch_dashboard_snapshot(
         market_open=is_open,
         next_open_utc=next_open_utc,
         heartbeat=hb,
+        reference_utc=now_utc,
     )
 
     # 1. Active Open Position & Child Exit Legs
@@ -889,3 +902,4 @@ def _build_daily_pnl_rows(
             )
         )
     return rows
+

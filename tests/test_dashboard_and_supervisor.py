@@ -14,13 +14,14 @@ from streamlit.testing.v1 import AppTest
 from spy_daytrader.config import BotConfig
 from spy_daytrader.dashboard_data import (
     build_daily_takeaway,
+    build_header_status,
     fetch_dashboard_snapshot,
     format_sgt,
     translate_order_action,
     translate_order_status,
     translate_skip_reason,
 )
-from spy_daytrader.state_store import SQLiteStateLedger
+from spy_daytrader.state_store import BotHeartbeat, SQLiteStateLedger
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EMOJI_RE = re.compile(
@@ -51,6 +52,24 @@ def test_plain_english_translations_contain_zero_quant_jargon_and_sgt_format() -
     utc_dt = datetime(2026, 11, 16, 14, 35, tzinfo=timezone.utc)  # 22:35 SGT
     sgt_lbl = format_sgt(utc_dt)
     assert sgt_lbl == "Nov 16, 22:35 SGT"
+
+    # Remote GitHub Actions + Streamlit Cloud check: stale heartbeat (>10m) must not show yesterday's time
+    old_hb = BotHeartbeat(
+        symbol="SPY",
+        mode="alpha_max",
+        market_open=False,
+        status="MARKET_CLOSED",
+        next_open_utc=utc_dt,
+        updated_at_utc=utc_dt - timedelta(hours=18),
+    )
+    open_remote_hdr = build_header_status(
+        market_open=True,
+        next_open_utc=utc_dt + timedelta(days=1),
+        heartbeat=old_hb,
+        reference_utc=utc_dt,
+    )
+    assert "Connected to Alpaca Paper" in open_remote_hdr
+    assert "Last checked" not in open_remote_hdr
 
     sample_codes = [
         "OUTSIDE_ENTRY_WINDOW",
@@ -233,3 +252,4 @@ def test_streamlit_app_renders_headlessly_without_exceptions(monkeypatch: pytest
     at = AppTest.from_file(str(REPO_ROOT / "dashboard" / "streamlit_app.py"))
     at.run(timeout=10)
     assert not at.exception
+

@@ -108,3 +108,4 @@ def run_live_hub(
                 ui_proc.wait(timeout=5.0)
             except subprocess.TimeoutExpired:
                 ui_proc.kill()
+

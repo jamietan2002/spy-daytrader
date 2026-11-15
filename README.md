@@ -6,22 +6,25 @@ An institutional-grade Python intraday paper-trading bot, Minimalist Matte-Dark 
 
 ## Key Features & Production Safeguards
 
-1. **Always-On Single-Container Live Setup (`python main.py serve`)**:
-   - Runs **both** the autonomous US market-hours trading worker thread and the Minimalist Matte-Dark 2-Tab Streamlit UI inside one self-healing process (`Dockerfile`, `railway.toml`, `render.yaml`, `docker-compose.yml`).
-   - **Precision Market-Hours Loop (`21:30–04:00 SGT`)**: Wakes boundary-snapped at `:00:01.5s` every minute during NYSE sessions, drops into low-power 5-minute standby outside market hours, and wakes automatically 2 minutes before the next opening bell.
+1. **100% Free-Forever Autonomous Hosting (`GitHub Actions` + `Streamlit Community Cloud`)**:
+   - **Market-Hours Session Runner ([`.github/workflows/intraday_session.yml`](./.github/workflows/intraday_session.yml))**: Two overlap-safe scheduled workflows (`Morning 13:20 UTC` + `Afternoon 16:50 UTC` with `concurrency` handoff) wake boundary-snapped at `:00:01.5s` every minute across the full `09:30–16:00 ET` (`21:30–04:00 SGT`) NYSE session, exit immediately on holidays, flatten 5 minutes before close (`15:55 ET` or `12:55 ET` on early-close half-days), and sync `data/bot_state.db` back to `main` — `$0/month` forever with no 30-day trial expiry.
+   - **Single-Container Local / Docker Supervisor (`python main.py serve`)**: Can also run both the background bot worker and Streamlit UI in one self-healing process locally or via Docker.
 2. **Minimalist Matte-Dark 2-Tab Web UI (`dashboard/streamlit_app.py`)**:
    - **`Today & Open Trade`**: Real-time Paper equity, today's P&L, 30-day realized P&L & win rate, active trade details (`Shares`, `Entry / Current Price`, `Unrealized P&L`, `Auto Stop-Loss`, `Profit Target`, `Mandatory Close` in `SGT`), and today's fills in plain everyday English.
    - **`Daily P&L & Journal`**: Day-by-day P&L history table plus a focused single-day journal (`← Previous` / `Next →`) with a 1-sentence `Daily Takeaway` banner and `Date / Time (SGT)` timestamps.
    - Zero emojis, no left sidebar, no manual sync clutter (auto-refreshes every `30s`).
-3. **Hard Paper-Trading Safety Lock & Bot-Scoped OMS Isolation (`spydt-*`)**:
+3. **Hard Paper-Trading Safety Lock & Dedicated Account Isolation (`spydt-*`)**:
    - Refuses to start unless `ALPACA_PAPER=true` and `ALPACA_BASE_URL=https://paper-api.alpaca.markets` (`LiveTradingProhibitedError`).
-   - WAL-mode SQLite state ledger (`data/bot_state.db`) persists heartbeats, processed 5m bars, and `spydt-*` orders, enforcing a `-2.5%` daily drawdown circuit breaker and `15:55 ET` EOD flatten that never touches external account positions.
+   - Dedicated to isolated Alpaca Paper Account #3 (`PA3OSGSIE`) with WAL-mode SQLite ledger (`data/bot_state.db`), `-2.5%` daily drawdown circuit breaker, and `15:55 ET` EOD flatten.
 
 ---
 
 ## Quickstart
 
-### 1. Local Setup & Live Hub
+### 1. Free-Forever Cloud Setup (`GitHub Actions` + `Streamlit Community Cloud`)
+See [**DEPLOYMENT.md**](./DEPLOYMENT.md) for the 1-minute Streamlit Community Cloud setup (`share.streamlit.io`).
+
+### 2. Local Setup & Live Hub
 ```bash
 /Library/GoogleCorpSupport/Python/3.11/bin/python3.11 -m venv .venv
 .venv/bin/pip install --only-binary :all: -r requirements.txt
@@ -34,17 +37,14 @@ cp .env.example .env
 .venv/bin/python main.py serve --port 8501
 ```
 
-### 2. Cloud Deployment (`Railway` / `Render` / `Docker`)
-See [**DEPLOYMENT.md**](./DEPLOYMENT.md) for 2-minute deployment instructions using [`Dockerfile`](./Dockerfile), [`railway.toml`](./railway.toml), [`render.yaml`](./render.yaml), or [`docker-compose.yml`](./docker-compose.yml).
-
 ### 3. CLI Reference
 ```bash
-.venv/bin/python main.py serve                  # Run bot worker + Minimalist Dark Web UI ($PORT / 8501)
-.venv/bin/python main.py serve --no-bot         # Run Web UI only
-.venv/bin/python main.py run                    # Run headless 1-minute Paper bot
-.venv/bin/python main.py status                 # Check Paper equity, clock, ledger P&L, & exposure
+.venv/bin/python main.py session --until-et 16:05  # Bounded NYSE session runner (GitHub Actions)
+.venv/bin/python main.py serve                     # Run bot worker + Minimalist Dark Web UI ($PORT / 8501)
+.venv/bin/python main.py run                       # Run continuous 24/7 headless loop
+.venv/bin/python main.py status                    # Check Paper equity, clock, ledger P&L, & exposure
 .venv/bin/python main.py backtest --days 180 --compare
-.venv/bin/python main.py flatten                # Cancel bot orders & flatten intraday exposure
+.venv/bin/python main.py flatten                   # Cancel bot orders & flatten intraday exposure
 ```
 
 ### 4. Automated Verification Suite

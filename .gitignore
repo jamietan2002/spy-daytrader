@@ -18,15 +18,13 @@ htmlcov/
 .ruff_cache/
 .mypy_cache/
 
-# Runtime logs & local state
+# Runtime logs & transient SQLite WAL/SHM files (allow data/bot_state.db for GitHub Actions <-> Streamlit Cloud sync)
 logs/
-data/
 *.log
-*.sqlite
-*.db
+data/*.db-wal
+data/*.db-shm
 
 # macOS / IDE
 .DS_Store
 .idea/
 .vscode/
-

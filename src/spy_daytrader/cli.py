@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import time
 import sys
 
 from spy_daytrader.backtest import BacktestReport, generate_synthetic_spy_5m_bars, run_backtest
@@ -61,7 +62,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--no-bot", action="store_true", help="Serve only the Web UI without background bot")
     p_serve.add_argument("--dry-run", action="store_true", help="Run bot in dry-run mode alongside live UI")
 
-    # 2. Headless 1-minute Paper Loop
+    # 2. Bounded Market-Session Loop (Free-Forever GitHub Actions Runner)
+    p_sess = sub.add_parser(
+        "session",
+        help="Run 1-minute paper loop for today's NYSE session until --until-et or market close",
+    )
+    p_sess.add_argument(
+        "--until-et",
+        default=None,
+        help="Optional US Eastern cutoff HH:MM (e.g. 12:58 for morning session handoff, 16:05 for close)",
+    )
+    p_sess.add_argument("--mode", choices=["alpha_max", "baseline"], default=None)
+    p_sess.add_argument("--atr-profile", choices=["standard", "wide"], default=None)
+    p_sess.add_argument("--symbol", default=None)
+    p_sess.add_argument("--dry-run", action="store_true")
+
+    # 3. Headless 1-minute Paper Loop
     p_run = sub.add_parser("run", help="Start the headless boundary-snapped 1-minute Alpaca Paper loop")
     p_run.add_argument("--mode", choices=["alpha_max", "baseline"], default=None)
     p_run.add_argument("--atr-profile", choices=["standard", "wide"], default=None)
@@ -123,6 +139,14 @@ def main(argv: list[str] | None = None) -> int:
             enable_bot=not bool(args.no_bot),
             dry_run=bool(args.dry_run),
         )
+
+    if args.command == "session":
+        until_et_val: time | None = None
+        if args.until_et:
+            hh, mm = [int(p) for p in str(args.until_et).strip().split(":", 1)]
+            until_et_val = time(hh, mm)
+        bot = IntradayTradingBot(cfg)
+        return bot.run_market_session(until_et=until_et_val, dry_run=bool(args.dry_run))
 
     if args.command == "run":
         bot = IntradayTradingBot(cfg)

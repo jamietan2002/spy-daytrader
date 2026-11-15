@@ -1,0 +1,112 @@
+name: Autonomous Market-Hours Day Trader (Free Forever)
+
+on:
+  schedule:
+    # Session Part 1 (Morning Open -> Midday Handoff): Mon-Fri 13:20 UTC (09:20 EDT / 08:20 EST)
+    - cron: "20 13 * * 1-5"
+    # Session Part 2 (Midday Handoff -> 15:55 ET EOD Flatten & Close): Mon-Fri 16:50 UTC (12:50 EDT / 11:50 EST)
+    - cron: "50 16 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Command to execute (session | once | status | flatten)"
+        required: false
+        default: "session"
+      until_et:
+        description: "Optional US Eastern cutoff HH:MM for session mode (e.g. 16:05)"
+        required: false
+        default: ""
+
+# Seamless midday handoff: when Part 2 starts, Part 1 finishes its cycle cleanly and hands over with zero gap
+concurrency:
+  group: spy-daytrader-market-session
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  intraday-trading-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 315
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      ALPACA_PAPER: "true"
+      ALPACA_BASE_URL: "https://paper-api.alpaca.markets"
+      ALPACA_DATA_FEED: "iex"
+      STRATEGY_MODE: "alpha_max"
+      ATR_PROFILE: "standard"
+      TRADING_SYMBOL: "SPY"
+      STATE_DB_PATH: "data/bot_state.db"
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      EVENT_SCHEDULE: ${{ github.event.schedule }}
+      INPUT_ACTION: ${{ github.event.inputs.action }}
+      INPUT_UNTIL_ET: ${{ github.event.inputs.until_et }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install --no-deps -e .
+
+      - name: Run Safety & Unit Test Suite
+        run: |
+          pytest -q
+
+      - name: Run Autonomous Market-Hours Bot
+        run: |
+          ACTION="${INPUT_ACTION:-session}"
+          if [ "$EVENT_SCHEDULE" = "20 13 * * 1-5" ]; then
+            python main.py session --until-et 12:58
+          elif [ "$EVENT_SCHEDULE" = "50 16 * * 1-5" ]; then
+            python main.py session --until-et 16:05
+          elif [ "$ACTION" = "session" ]; then
+            if [ -n "$INPUT_UNTIL_ET" ]; then
+              python main.py session --until-et "$INPUT_UNTIL_ET"
+            else
+              python main.py session --until-et 16:05
+            fi
+          elif [ "$ACTION" = "once" ]; then
+            python main.py once
+          elif [ "$ACTION" = "status" ]; then
+            python main.py status
+          elif [ "$ACTION" = "flatten" ]; then
+            python main.py flatten
+          else
+            echo "Unknown action: $ACTION" && exit 1
+          fi
+
+      - name: Checkpoint & Sync SQLite State Ledger
+        if: always()
+        run: |
+          python - << 'EOF'
+          import sqlite3
+          from pathlib import Path
+          db = Path("data/bot_state.db")
+          if db.exists():
+              conn = sqlite3.connect(str(db))
+              conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+              conn.close()
+          EOF
+          if [ -f data/bot_state.db ]; then
+            git config user.name "spy-daytrader-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add data/bot_state.db
+            if ! git diff --staged --quiet; then
+              git commit -m "chore(state): sync autonomous intraday bot_state.db [skip ci]"
+              git pull --rebase origin main || true
+              git push origin HEAD:main || true
+            fi
+          fi

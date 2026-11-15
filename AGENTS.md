@@ -11,7 +11,7 @@
    - Always fetch `>= 250` (default `650`) RTH 5-minute bars so `EMA(200)` is non-NaN and converged.
 4. **Bot-Scoped OMS Isolation (`spydt-*` + `SQLiteStateLedger`)**:
    - Every order must carry a deterministic `spydt-*` `client_order_id` and be recorded in `data/bot_state.db`.
-   - EOD flatten (`15:55 ET`) must cancel child bracket orders before calling `close_position` and must never liquidate external positions not originated by `spydt-*` unless `--force-unowned` is explicitly invoked by the operator.
+   - EOD flatten (`15:55 ET` or `<= 5m` before early-close half-days) must cancel child bracket orders before calling `close_position` and must never liquidate external positions not originated by `spydt-*` unless `--force-unowned` is explicitly invoked by the operator.
 5. **Minimalist Matte-Dark UI Standards (`dashboard/streamlit_app.py` & `dashboard_data.py`)**:
    - Enforce `#0c0e12` matte-dark canvas, `#13161c` cards, tabular numerals, zero emojis, no left sidebar, green (`#22c55e`) / red (`#ef4444`) strictly on financial outcomes, plain-English summaries with zero raw quant jargon, and explicit `Date / Time (SGT)` timestamps.
 
@@ -19,7 +19,8 @@
 
 | File | Responsibility |
 |---|---|
-| `main.py` / `src/spy_daytrader/cli.py` | CLI (`serve`, `run`, `once`, `status`, `flatten`, `backtest`) |
+| `main.py` / `src/spy_daytrader/cli.py` | CLI (`session`, `serve`, `run`, `once`, `status`, `flatten`, `backtest`) |
+| `.github/workflows/intraday_session.yml` | Free-forever Morning + Afternoon NYSE market-hours GitHub Actions runner & SQLite sync |
 | `src/spy_daytrader/supervisor.py` | Single-container Cloud Supervisor (background bot thread + Streamlit `$PORT` server) |
 | `dashboard/streamlit_app.py` | Minimalist Matte-Dark 2-Tab UI (`Today & Open Trade`, `Daily P&L & Journal`) |
 | `src/spy_daytrader/dashboard_data.py` | Live Alpaca + SQLite plain-English telemetry, round-trip P&L, & SGT formatting |
@@ -30,9 +31,9 @@
 | `src/spy_daytrader/risk.py` | `1%` equity risk sizing, buying-power cap, Marketable Limit collar, circuit breakers |
 | `src/spy_daytrader/state_store.py` | WAL-mode SQLite persistence (`bot_heartbeat`, `processed_bars`, `bot_orders`) |
 | `src/spy_daytrader/broker.py` | Alpaca `TradingClient` adapter, stale limit auto-cancel, isolated EOD flatten |
-| `src/spy_daytrader/engine.py` | Boundary-snapped (`:00:01.5s`) 1m execution loop & smart off-hours standby |
+| `src/spy_daytrader/engine.py` | Boundary-snapped (`:00:01.5s`) 1m execution loop, `run_market_session`, & off-hours standby |
 | `src/spy_daytrader/backtest.py` | Event-driven 5m chronological backtester with limit-collar & slippage physics |
-| `Dockerfile` / `railway.toml` / `render.yaml` | Always-on cloud container deployment manifests |
+| `Dockerfile` / `render.yaml` / `docker-compose.yml` | Optional self-hosted / free-tier Docker manifests |
 
 ## 3. Mandatory Verification Before Committing
 Always run:

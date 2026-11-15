@@ -285,3 +285,76 @@ def test_quote_anchor_duplicate_cid_and_cli_compare(tmp_path: Path, capsys: pyte
     assert "baseline/std" in out
     assert "alpha_max/std" in out
     assert "alpha_max/wide" in out
+
+
+def test_run_market_session_holiday_exit_cutoff_and_halfday_flatten(tmp_path: Path) -> None:
+    from datetime import time as dt_time
+
+    cfg = BotConfig(
+        alpaca_api_key="k",
+        alpaca_secret_key="s",
+        poll_interval_seconds=10,
+        state_db_path=str(tmp_path / "sess.db"),
+    )
+    ledger = SQLiteStateLedger(cfg.state_db_path)
+
+    # 1. Holiday / weekend instant exit (market closed today; next_open is tomorrow)
+    now_holiday = datetime(2026, 11, 26, 10, 0, 0, tzinfo=NY_TZ).astimezone(timezone.utc)
+    next_open_fri = datetime(2026, 11, 27, 9, 30, 0, tzinfo=NY_TZ).astimezone(timezone.utc)
+    hol_client = MockTradingClient(is_open=False)
+    hol_client.get_clock = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        is_open=False,
+        timestamp=now_holiday,
+        next_open=next_open_fri,
+        next_close=next_open_fri,
+    )
+    hol_broker = AlpacaPaperBroker(cfg, trading_client=hol_client, ledger=ledger)  # type: ignore[arg-type]
+    hol_bot = IntradayTradingBot(
+        cfg,
+        data_feed=StubDataFeed(generate_synthetic_spy_5m_bars(5)),
+        broker=hol_broker,
+        ledger=ledger,
+        now_fn=lambda: now_holiday,  # type: ignore[arg-type]
+    )
+    assert hol_bot.run_market_session(register_signals=False) == 0
+    hb = ledger.get_latest_heartbeat()
+    assert hb is not None and hb.status == "MARKET_CLOSED"
+
+    # 2. Early-close half-day (Black Friday 12:56 ET, 4m before 13:00 ET close) triggers EOD flatten!
+    now_halfday = datetime(2026, 11, 27, 12, 56, 0, tzinfo=NY_TZ).astimezone(timezone.utc)
+    close_halfday = datetime(2026, 11, 27, 13, 0, 0, tzinfo=NY_TZ).astimezone(timezone.utc)
+    ledger.record_order_submission(
+        client_order_id="spydt-spy-amx-lng-20261127T1015",
+        broker_order_id="ord-bf",
+        symbol="SPY",
+        mode="alpha_max",
+        side="BUY",
+        order_type="LIMIT",
+        qty=50,
+        reference_price=585.0,
+        limit_price=585.05,
+        stop_loss_price=583.5,
+        take_profit_price=587.25,
+        status="filled",
+        session_date=datetime(2026, 11, 27, tzinfo=NY_TZ).date(),
+    )
+    bf_client = MockTradingClient(positions=[SimpleNamespace(symbol="SPY", qty="50")])
+    bf_client.get_clock = lambda: SimpleNamespace(  # type: ignore[method-assign]
+        is_open=True,
+        timestamp=now_halfday,
+        next_open=datetime(2026, 11, 30, 9, 30, 0, tzinfo=NY_TZ).astimezone(timezone.utc),
+        next_close=close_halfday,
+    )
+    bf_broker = AlpacaPaperBroker(cfg, trading_client=bf_client, ledger=ledger)  # type: ignore[arg-type]
+    bf_bot = IntradayTradingBot(
+        cfg,
+        data_feed=StubDataFeed(generate_synthetic_spy_5m_bars(5)),
+        broker=bf_broker,
+        ledger=ledger,
+        now_fn=lambda: now_halfday,  # type: ignore[arg-type]
+    )
+    assert bf_bot.run_market_session(until_et=dt_time(12, 55), register_signals=False) == 0
+    assert bf_client.closed_symbols == []  # exited cleanly because 12:56 >= 12:55 cutoff
+
+    assert bf_bot.run_market_session(until_et=dt_time(13, 5), max_cycles=1, register_signals=False) == 0
+    assert bf_client.closed_symbols == ["SPY"]
