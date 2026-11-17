@@ -1,11 +1,12 @@
 name: Autonomous Market-Hours Day Trader (Free Forever)
 
+# Triggered on-time ($0/mo) via External Edge Cron -> GitHub `workflow_dispatch` REST API
+# (Cloudflare Workers Cron Trigger in `trader/infrastructure/cloudflare_cron/` or `cron-job.org`):
+#   - Session Part 1 (Mon-Fri 09:20 ET): `inputs: { action: "session", until_et: "12:58" }`
+#   - Session Part 2 (Mon-Fri 12:50 ET): `inputs: { action: "session", until_et: "16:05" }`
+# Native GitHub `on: schedule` is intentionally omitted to prevent 2-8h queue delays, dropped
+# morning starts, and late cron events accidentally cancelling active `workflow_dispatch` sessions.
 on:
-  schedule:
-    # Session Part 1 (Morning Open -> Midday Handoff): Mon-Fri 13:20 UTC (09:20 EDT / 08:20 EST)
-    - cron: "20 13 * * 1-5"
-    # Session Part 2 (Midday Handoff -> 15:55 ET EOD Flatten & Close): Mon-Fri 16:50 UTC (12:50 EDT / 11:50 EST)
-    - cron: "50 16 * * 1-5"
   workflow_dispatch:
     inputs:
       action:
@@ -13,11 +14,11 @@ on:
         required: false
         default: "session"
       until_et:
-        description: "Optional US Eastern cutoff HH:MM for session mode (e.g. 16:05)"
+        description: "Optional US Eastern cutoff HH:MM for session mode (auto: 12:58 before 11:30 ET, else 16:05)"
         required: false
         default: ""
 
-# Seamless midday handoff: when Part 2 starts, Part 1 finishes its cycle cleanly and hands over with zero gap
+# Seamless midday handoff: when Part 2 (12:50 ET) starts, Part 1 finishes cleanly and hands over with zero gap
 concurrency:
   group: spy-daytrader-market-session
   cancel-in-progress: true
@@ -40,7 +41,6 @@ jobs:
       STATE_DB_PATH: "data/bot_state.db"
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-      EVENT_SCHEDULE: ${{ github.event.schedule }}
       INPUT_ACTION: ${{ github.event.inputs.action }}
       INPUT_UNTIL_ET: ${{ github.event.inputs.until_et }}
     steps:
@@ -67,16 +67,14 @@ jobs:
       - name: Run Autonomous Market-Hours Bot
         run: |
           ACTION="${INPUT_ACTION:-session}"
-          if [ "$EVENT_SCHEDULE" = "20 13 * * 1-5" ]; then
-            python main.py session --until-et 12:58
-          elif [ "$EVENT_SCHEDULE" = "50 16 * * 1-5" ]; then
-            python main.py session --until-et 16:05
-          elif [ "$ACTION" = "session" ]; then
+          if [ "$ACTION" = "session" ]; then
             if [ -n "$INPUT_UNTIL_ET" ]; then
-              python main.py session --until-et "$INPUT_UNTIL_ET"
+              UNTIL_ET="$INPUT_UNTIL_ET"
             else
-              python main.py session --until-et 16:05
+              UNTIL_ET="$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; now = datetime.now(ZoneInfo("America/New_York")); print("12:58" if (now.hour, now.minute) < (11, 30) else "16:05")')"
             fi
+            echo "[SESSION] Starting autonomous SPY session until ${UNTIL_ET} ET..."
+            python main.py session --until-et "$UNTIL_ET"
           elif [ "$ACTION" = "once" ]; then
             python main.py once
           elif [ "$ACTION" = "status" ]; then

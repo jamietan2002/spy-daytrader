@@ -424,3 +424,13 @@ def test_broker_trade_stream_hub_event_driven_fills_and_zero_polling_when_flat(t
         hub.stop()
 
 
+def test_intraday_workflow_uses_workflow_dispatch_without_native_schedule_lag() -> None:
+    wf_path = REPO_ROOT / ".github" / "workflows" / "intraday_session.yml"
+    wf_text = wf_path.read_text(encoding="utf-8")
+    assert "workflow_dispatch:" in wf_text
+    assert "\n  schedule:" not in wf_text
+    assert 'ZoneInfo("America/New_York")' in wf_text
+    assert "12:58" in wf_text and "16:05" in wf_text
+
+
+
