@@ -20,7 +20,8 @@
 | File | Responsibility |
 |---|---|
 | `main.py` / `src/spy_daytrader/cli.py` | CLI (`session`, `serve`, `run`, `once`, `status`, `flatten`, `backtest`) |
-| `.github/workflows/intraday_session.yml` | Free-forever `workflow_dispatch` Morning (`09:20 ET`) + Afternoon (`12:50 ET`) NYSE market-hours GitHub Actions runner (triggered via External Edge Cron) & SQLite sync |
+| `.github/workflows/intraday_session.yml` | Free-forever `workflow_dispatch` Morning (`09:20 ET`) + Afternoon (`12:50 ET`) NYSE market-hours GitHub Actions runner with zero-kill midday handoff & SQLite sync |
+| `infrastructure/cloudflare_cron/` | Dedicated DST-aware Cloudflare Worker (`worker.js`, `wrangler.toml`) & `cron-job.org` (`setup_cronjob_org.py`) dispatcher for `spy-daytrader` |
 | `src/spy_daytrader/supervisor.py` | Single-container Cloud Supervisor (background bot thread + Streamlit `$PORT` server) |
 | `dashboard/streamlit_app.py` | Minimalist Matte-Dark 2-Tab UI (`Today & Open Trade`, `Daily P&L & Journal`) |
 | `src/spy_daytrader/live_stream.py` | Event-driven Alpaca `TradingStream` WebSocket listener & `@st.cache_resource` RAM snapshot hub |

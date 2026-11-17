@@ -1,11 +1,16 @@
 name: Autonomous Market-Hours Day Trader (Free Forever)
 
 # Triggered on-time ($0/mo) via External Edge Cron -> GitHub `workflow_dispatch` REST API
-# (Cloudflare Workers Cron Trigger in `trader/infrastructure/cloudflare_cron/` or `cron-job.org`):
+# (`infrastructure/cloudflare_cron/worker.js` or `cron-job.org`):
 #   - Session Part 1 (Mon-Fri 09:20 ET): `inputs: { action: "session", until_et: "12:58" }`
 #   - Session Part 2 (Mon-Fri 12:50 ET): `inputs: { action: "session", until_et: "16:05" }`
-# Native GitHub `on: schedule` is intentionally omitted to prevent 2-8h queue delays, dropped
-# morning starts, and late cron events accidentally cancelling active `workflow_dispatch` sessions.
+#
+# Hardened Midday Handoff (Zero-Kill Overlap):
+#   - Part 1 and Part 2 use separate concurrency groups with `cancel-in-progress: false` so
+#     Part 2 NEVER kills Part 1 while Part 2 is booting, installing deps, running `pytest`, or
+#     verifying Alpaca health (`python main.py status`).
+#   - Once Part 2 is healthy, it waits cleanly for Part 1's 12:58 ET exit & `bot_state.db` push,
+#     pulls the morning SQLite state, and takes over seamlessly for 12:59–16:05 ET.
 on:
   workflow_dispatch:
     inputs:
@@ -18,10 +23,9 @@ on:
         required: false
         default: ""
 
-# Seamless midday handoff: when Part 2 (12:50 ET) starts, Part 1 finishes cleanly and hands over with zero gap
 concurrency:
-  group: spy-daytrader-market-session
-  cancel-in-progress: true
+  group: spy-daytrader-session-${{ github.event.inputs.until_et || github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -63,6 +67,61 @@ jobs:
       - name: Run Safety & Unit Test Suite
         run: |
           pytest -q
+
+      - name: Preflight Broker & Ledger Health Check
+        run: |
+          python main.py status
+
+      - name: Wait for Part 1 Handoff & Pull Morning State (Part 2 Only)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          ACTION="${INPUT_ACTION:-session}"
+          if [ "$ACTION" != "session" ]; then
+            exit 0
+          fi
+          UNTIL_ET="$INPUT_UNTIL_ET"
+          if [ -z "$UNTIL_ET" ]; then
+            UNTIL_ET="$(python -c 'from datetime import datetime; from zoneinfo import ZoneInfo; now = datetime.now(ZoneInfo("America/New_York")); print("12:58" if (now.hour, now.minute) < (11, 30) else "16:05")')"
+          fi
+          if [ "$UNTIL_ET" != "16:05" ]; then
+            exit 0
+          fi
+          python - << 'EOF'
+          import json, os, time, urllib.request
+          from datetime import datetime, time as dt_time
+          from zoneinfo import ZoneInfo
+
+          ny = ZoneInfo("America/New_York")
+          repo = os.environ["GITHUB_REPO"]
+          cur_id = int(os.environ["CURRENT_RUN_ID"])
+          token = os.environ["GH_TOKEN"]
+
+          def part1_active() -> bool:
+              url = f"https://api.github.com/repos/{repo}/actions/workflows/intraday_session.yml/runs?status=in_progress&per_page=10"
+              req = urllib.request.Request(url, headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "User-Agent": "spy-daytrader-handoff/1.0",
+              })
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      runs = json.loads(r.read().decode()).get("workflow_runs") or []
+                  return any(int(run["id"]) != cur_id for run in runs)
+              except Exception as exc:
+                  print("Handoff poll warning:", exc)
+                  return False
+
+          while datetime.now(ny).time() < dt_time(12, 58, 30):
+              if not part1_active():
+                  print("[HANDOFF] Part 1 completed; proceeding with Part 2.")
+                  break
+              print("[HANDOFF] Part 2 healthy; waiting 10s for Part 1 clean 12:58 ET exit...")
+              time.sleep(10)
+          EOF
+          git pull --rebase origin main || true
 
       - name: Run Autonomous Market-Hours Bot
         run: |

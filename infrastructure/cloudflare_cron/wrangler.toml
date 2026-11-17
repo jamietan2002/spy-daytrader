@@ -1,0 +1,16 @@
+name = "spy-daytrader-workflow-dispatcher"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# Uses 1 Cron Trigger (~288 req/day, <0.3% of Cloudflare Free's 100,000 req/day quota),
+# evaluating exact `America/New_York` wall-clock time so EDT <-> EST transitions are automatic.
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+GITHUB_OWNER = "jamietan2002"
+GITHUB_REPO = "spy-daytrader"
+
+# Set `GITHUB_PAT` securely as an encrypted Worker Secret (never commit tokens here):
+#   Cloudflare Dashboard -> Workers & Pages -> spy-daytrader-workflow-dispatcher -> Settings -> Variables and Secrets
+

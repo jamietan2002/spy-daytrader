@@ -425,12 +425,25 @@ def test_broker_trade_stream_hub_event_driven_fills_and_zero_polling_when_flat(t
 
 
 def test_intraday_workflow_uses_workflow_dispatch_without_native_schedule_lag() -> None:
+    from infrastructure.cloudflare_cron.setup_cronjob_org import build_dispatch_job_specs
+
     wf_path = REPO_ROOT / ".github" / "workflows" / "intraday_session.yml"
     wf_text = wf_path.read_text(encoding="utf-8")
     assert "workflow_dispatch:" in wf_text
     assert "\n  schedule:" not in wf_text
+    assert "cancel-in-progress: false" in wf_text
+    assert "Wait for Part 1 Handoff" in wf_text
     assert 'ZoneInfo("America/New_York")' in wf_text
     assert "12:58" in wf_text and "16:05" in wf_text
+
+    worker_js = (REPO_ROOT / "infrastructure" / "cloudflare_cron" / "worker.js").read_text(encoding="utf-8")
+    assert "America/New_York" in worker_js
+    assert "intraday_session.yml" in worker_js
+    assert "autonomous_trading.yml" not in worker_js
+
+    specs = build_dispatch_job_specs("jamietan2002", "test_pat_placeholder")
+    assert len(specs) == 2
+    assert all(j["schedule"]["timezone"] == "America/New_York" for j in specs)
 
 
 
